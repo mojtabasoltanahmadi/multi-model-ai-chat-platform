@@ -1,0 +1,16 @@
+# Optional: a local PostgreSQL for development.
+# Usage: docker compose -f infra/docker-compose.yml up -d
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ai_chat_mvp
+    ports:
+      - '5432:5432'
+    volumes:
+      - ai_chat_pgdata:/var/lib/postgresql/data
+
+volumes:
+  ai_chat_pgdata:
