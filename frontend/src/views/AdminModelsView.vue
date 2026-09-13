@@ -1,60 +1,72 @@
-<script setup>
+<script setup lang="ts">
 import { onMounted, ref } from 'vue';
+import { useRouter } from 'vue-router';
+import BrandMark from '../components/ui/BrandMark.vue';
+import AppButton from '../components/ui/AppButton.vue';
+import AppModal from '../components/ui/AppModal.vue';
+import AppSkeleton from '../components/ui/AppSkeleton.vue';
+import ErrorState from '../components/ui/ErrorState.vue';
+import ModelTable from '../components/admin/ModelTable.vue';
+import ModelForm from '../components/admin/ModelForm.vue';
 import { api } from '../api/client';
-import { useAuth } from '../stores/auth';
+import type { AiModel, CreateModelPayload } from '../api/types';
+import { useAuth } from '../composables/useAuth';
+import { useToast } from '../composables/useToast';
 
+const router = useRouter();
 const auth = useAuth();
+const toast = useToast();
 
-const models = ref([]);
-const error = ref('');
-const notice = ref('');
-const busy = ref(false);
-
-const form = ref(emptyForm());
-const showForm = ref(false);
-
-function emptyForm() {
-  return {
-    name: '',
-    provider: 'mock',
-    externalModelId: '',
-    baseUrl: '',
-    apiKey: '',
-    isActive: true,
-  };
-}
+const models = ref<AiModel[]>([]);
+const loading = ref(true);
+const loadError = ref(false);
+const showCreateForm = ref(false);
+const pendingDelete = ref<AiModel | null>(null);
+const actionBusy = ref(false);
 
 onMounted(load);
 
 async function load() {
-  error.value = '';
+  loading.value = true;
+  loadError.value = false;
   try {
-    models.value = await api('/admin/models');
-  } catch (e) {
-    error.value = e.message;
-  }
-}
-
-async function createModel() {
-  error.value = '';
-  notice.value = '';
-  busy.value = true;
-  try {
-    await api('/admin/models', { method: 'POST', body: form.value });
-    form.value = emptyForm();
-    showForm.value = false;
-    await load();
-    notice.value = 'مدل ساخته شد.';
-  } catch (e) {
-    error.value = e.message;
+    models.value = await api<AiModel[]>('/admin/models');
+  } catch {
+    loadError.value = true;
   } finally {
-    busy.value = false;
+    loading.value = false;
   }
 }
 
-async function toggleActive(model) {
-  error.value = '';
-  notice.value = '';
+async function createModel(values: CreateModelPayload) {
+  actionBusy.value = true;
+  try {
+    await api('/admin/models', { method: 'POST', body: values });
+    showCreateForm.value = false;
+    toast.success('مدل با موفقیت ساخته شد.');
+    await load();
+  } catch (e) {
+    toast.error(e instanceof Error ? e.message : 'ساخت مدل ناموفق بود.');
+  } finally {
+    actionBusy.value = false;
+  }
+}
+
+async function setDefault(model: AiModel) {
+  actionBusy.value = true;
+  try {
+    await api(`/admin/models/${model.id}/default`, { method: 'POST' });
+    await load();
+    toast.success(`«${model.name}» پیش‌فرض شد.`);
+  } catch (e) {
+    toast.error(e instanceof Error ? e.message : 'عملیات ناموفق بود.');
+  } finally {
+    actionBusy.value = false;
+  }
+}
+
+async function toggleActive(model: AiModel) {
+  actionBusy.value = true;
   try {
     await api(`/admin/models/${model.id}`, {
       method: 'PATCH',
@@ -62,133 +74,197 @@ async function toggleActive(model) {
     });
     await load();
   } catch (e) {
-    error.value = e.message;
+    toast.error(e instanceof Error ? e.message : 'عملیات ناموفق بود.');
+  } finally {
+    actionBusy.value = false;
   }
 }
 
-async function makeDefault(model) {
-  error.value = '';
-  notice.value = '';
-  try {
-    await api(`/admin/models/${model.id}/default`, { method: 'POST' });
-    await load();
-    notice.value = `«${model.name}» پیش‌فرض شد.`;
-  } catch (e) {
-    error.value = e.message;
-  }
-}
-
-async function removeModel(model) {
-  error.value = '';
-  notice.value = '';
+async function removeModel() {
+  const model = pendingDelete.value;
+  if (!model) return;
+  actionBusy.value = true;
   try {
     await api(`/admin/models/${model.id}`, { method: 'DELETE' });
+    pendingDelete.value = null;
     await load();
+    toast.success(`«${model.name}» حذف شد.`);
   } catch (e) {
-    error.value = e.message;
+    toast.error(e instanceof Error ? e.message : 'حذف ناموفق بود.');
+  } finally {
+    actionBusy.value = false;
   }
 }
 
-async function logout() {
-  auth.clearAuth();
-  window.location.assign('/login');
+function goBack() {
+  void router.push({ name: 'chat' });
+}
+
+function logout() {
+  auth.logout();
+  void router.push({ name: 'login' });
 }
 </script>
 
 <template>
-  <main class="admin-page">
-    <header>
-      <h1>مدیریت مدل‌های هوش مصنوعی</h1>
-      <div style="display: flex; gap: 0.5rem">
-        <router-link to="/" class="muted-link">بازگشت به چت</router-link>
-        <button class="secondary" @click="logout">خروج</button>
+  <main class="admin">
+    <header class="admin__header">
+      <div class="admin__brand">
+        <BrandMark :size="26" />
+        <div>
+          <h1 class="admin__title">مدیریت مدل‌های هوش مصنوعی</h1>
+          <p class="admin__subtitle">
+            مدل‌ها را فعال/غیرفعال کنید و مدل پیش‌فرض گفتگو را انتخاب کنید.
+          </p>
+        </div>
+      </div>
+      <div class="admin__header-actions">
+        <AppButton variant="ghost" size="sm" @click="goBack">بازگشت به چت</AppButton>
+        <AppButton variant="ghost" size="sm" @click="logout">خروج</AppButton>
       </div>
     </header>
 
-    <div v-if="error" class="error-banner">{{ error }}</div>
-    <p v-else-if="notice" class="muted-link">{{ notice }}</p>
+    <ErrorState
+      v-if="loadError"
+      title="بارگذاری مدل‌ها ناموفق بود"
+      description="ارتباط با سرور برقرار نشد. اتصال خود را بررسی کنید."
+      action-label="تلاش دوباره"
+      icon="offline"
+      @action="load"
+    />
 
-    <div v-if="!showForm" style="text-align: left">
-      <button @click="showForm = true">+ افزودن مدل</button>
-    </div>
+    <template v-else>
+      <div class="admin__toolbar">
+        <p class="admin__count">
+          {{ models.length.toLocaleString('fa-IR') }} مدل
+          <template v-if="models.some((m) => m.isDefault)">
+            · پیش‌فرض: {{ models.find((m) => m.isDefault)?.name }}
+          </template>
+        </p>
+        <AppButton :loading="actionBusy" @click="showCreateForm = true">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true">
+            <path d="M12 5v14M5 12h14" />
+          </svg>
+          افزودن مدل
+        </AppButton>
+      </div>
 
-    <form v-else class="model-form" @submit.prevent="createModel">
-      <h3>مدل جدید</h3>
-      <div class="field">
-        <label>نام نمایشی</label>
-        <input v-model="form.name" required maxlength="100" placeholder="مثلاً GPT-4o" />
+      <div v-if="loading" class="admin__loading">
+        <AppSkeleton :lines="1" width="30%" />
+        <AppSkeleton :lines="6" width="100%" />
       </div>
-      <div class="field">
-        <label>نوع ارائه‌دهنده</label>
-        <select v-model="form.provider">
-          <option value="mock">ماک (آزمایشی، بدون کلید)</option>
-          <option value="openai-compatible">سازگار با OpenAI</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>شناسه مدل نزد ارائه‌دهنده</label>
-        <input v-model="form.externalModelId" required dir="ltr" placeholder="gpt-4o-mini" />
-      </div>
-      <div class="field">
-        <label>آدرس پایه (اختیاری)</label>
-        <input v-model="form.baseUrl" dir="ltr" placeholder="https://api.openai.com/v1" />
-      </div>
-      <div class="field">
-        <label>کلید API (اختیاری برای ماک)</label>
-        <input v-model="form.apiKey" dir="ltr" type="password" placeholder="sk-…" />
-      </div>
-      <div class="field">
-        <label>وضعیت</label>
-        <select v-model="form.isActive">
-          <option :value="true">فعال</option>
-          <option :value="false">غیرفعال</option>
-        </select>
-      </div>
-      <div class="full row-actions" style="justify-content: flex-end">
-        <button type="button" class="secondary" @click="showForm = false">انصراف</button>
-        <button type="submit" :disabled="busy">{{ busy ? 'در حال ذخیره…' : 'ذخیره' }}</button>
-      </div>
-    </form>
 
-    <table>
-      <thead>
-        <tr>
-          <th>نام</th>
-          <th>نوع</th>
-          <th>شناسه</th>
-          <th>وضعیت</th>
-          <th>عملیات</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="model in models" :key="model.id">
-          <td>
-            {{ model.name }}
-            <span v-if="model.isDefault" class="badge default">پیش‌فرض</span>
-          </td>
-          <td>{{ model.provider === 'mock' ? 'ماک' : 'سازگار با OpenAI' }}</td>
-          <td dir="ltr">{{ model.externalModelId }}</td>
-          <td>
-            <span class="badge" :class="{ active: model.isActive }">
-              {{ model.isActive ? 'فعال' : 'غیرفعال' }}
-            </span>
-          </td>
-          <td>
-            <div class="row-actions">
-              <button v-if="!model.isDefault && model.isActive" @click="makeDefault(model)">
-                پیش‌فرض‌سازی
-              </button>
-              <button v-if="!model.isDefault" class="secondary" @click="toggleActive(model)">
-                {{ model.isActive ? 'غیرفعال‌سازی' : 'فعال‌سازی' }}
-              </button>
-              <button v-if="!model.isDefault" class="danger" @click="removeModel(model)">حذف</button>
-            </div>
-          </td>
-        </tr>
-        <tr v-if="models.length === 0">
-          <td colspan="5" class="muted-link">هنوز مدلی ثبت نشده است.</td>
-        </tr>
-      </tbody>
-    </table>
+      <ModelTable
+        v-else
+        :models="models"
+        @set-default="setDefault"
+        @toggle-active="toggleActive"
+        @remove="pendingDelete = $event"
+      />
+
+      <p v-if="!loading && models.length === 0" class="admin__empty">
+        هنوز مدلی ثبت نشده است. اولین مدل را اضافه کنید تا گفتگو شروع شود.
+      </p>
+    </template>
+
+    <ModelForm
+      v-if="showCreateForm"
+      @submit="createModel"
+      @close="showCreateForm = false"
+    />
+
+    <AppModal
+      v-if="pendingDelete"
+      title="حذف مدل"
+      @close="pendingDelete = null"
+    >
+      <p class="admin__confirm-text">
+        آیا از حذف «{{ pendingDelete.name }}» مطمئن هستید؟ این عملیات قابل بازگشت نیست.
+      </p>
+      <template #footer>
+        <AppButton variant="secondary" @click="pendingDelete = null">انصراف</AppButton>
+        <AppButton
+          variant="danger"
+          :loading="actionBusy"
+          @click="removeModel"
+        >
+          حذف مدل
+        </AppButton>
+      </template>
+    </AppModal>
   </main>
 </template>
+
+<style scoped>
+.admin {
+  max-width: 62rem;
+  margin: 0 auto;
+  padding: 2rem 1.4rem 3rem;
+  display: grid;
+  gap: 1.2rem;
+}
+
+.admin__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.admin__brand {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+}
+
+.admin__title {
+  font-size: 1.1rem;
+}
+
+.admin__subtitle {
+  font-size: 0.8rem;
+  color: var(--text-2);
+}
+
+.admin__header-actions {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.admin__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.admin__count {
+  font-size: 0.82rem;
+  color: var(--text-2);
+}
+
+.admin__loading {
+  display: grid;
+  gap: 1rem;
+  padding: 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.admin__empty {
+  padding: 2rem;
+  text-align: center;
+  color: var(--text-2);
+  font-size: 0.88rem;
+  background: var(--surface);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-lg);
+}
+
+.admin__confirm-text {
+  font-size: 0.88rem;
+  color: var(--text-1);
+}
+</style>

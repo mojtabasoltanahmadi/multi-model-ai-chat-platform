@@ -3,10 +3,27 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>چت هوشمند</title>
+    <meta name="description" content="هوش‌یار — پلتفرم چت هوش مصنوعی چندمدلی" />
+    <title>هوش‌یار · پلتفرم چت هوش مصنوعی</title>
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f7f7f4" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#101216" />
+    <script>
+      // Apply the persisted theme before first paint to avoid a flash.
+      (function () {
+        try {
+          var pref = localStorage.getItem('hooshyar.theme') || 'system';
+          var dark =
+            pref === 'dark' ||
+            (pref === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+        } catch (e) {
+          document.documentElement.dataset.theme = 'light';
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>
-    <script type="module" src="/src/main.js"></script>
+    <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

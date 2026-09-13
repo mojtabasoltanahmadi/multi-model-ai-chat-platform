@@ -1,25 +1,44 @@
-<script setup>
+<script setup lang="ts">
 import { computed, nextTick, onMounted, ref } from 'vue';
-import { useRouter } from 'vue-router';
-import { api, streamChatMessage } from '../api/client';
-import { useAuth } from '../stores/auth';
+import AppSidebar from '../components/layout/AppSidebar.vue';
+import ChatHeader from '../components/chat/ChatHeader.vue';
+import EmptyChat from '../components/chat/EmptyChat.vue';
+import MessageItem from '../components/chat/MessageItem.vue';
+import MessageComposer from '../components/chat/MessageComposer.vue';
+import AppSkeleton from '../components/ui/AppSkeleton.vue';
+import { api, streamChatMessage, type StreamHandle } from '../api/client';
+import type { AiModel, Conversation, Message } from '../api/types';
+import { useToast } from '../composables/useToast';
 
-const router = useRouter();
-const auth = useAuth();
+const toast = useToast();
 
-const conversations = ref([]);
-const activeConversationId = ref(null);
-const messages = ref([]);
-const models = ref([]);
+// ---- data ----
+const conversations = ref<Conversation[]>([]);
+const conversationsLoading = ref(true);
+const activeId = ref<string | null>(null);
+const messages = ref<Message[]>([]);
+const messagesLoading = ref(false);
+const models = ref<AiModel[]>([]);
 const selectedModelId = ref('');
-const draft = ref('');
-const streaming = ref(false);
+const drawerOpen = ref(false);
 const error = ref('');
-const loadingMessages = ref(false);
-const messagesEl = ref(null);
 
-const activeConversation = computed(() =>
-  conversations.value.find((c) => c.id === activeConversationId.value),
+// streaming placeholder id inside the messages list
+const STREAM_ID = '__streaming__';
+const streaming = ref(false);
+const streamHandle = ref<StreamHandle | null>(null);
+
+const completedMessages = computed(() =>
+  messages.value.filter((message) => message.id !== STREAM_ID),
+);
+const streamingMessage = computed(
+  () => messages.value.find((message) => message.id === STREAM_ID) ?? null,
+);
+const activeConversation = computed(
+  () => conversations.value.find((conversation) => conversation.id === activeId.value) ?? null,
+);
+const activeModel = computed(
+  () => models.value.find((model) => model.id === selectedModelId.value) ?? null,
 );
 
 onMounted(async () => {
@@ -27,215 +46,291 @@ onMounted(async () => {
 });
 
 async function loadConversations() {
+  conversationsLoading.value = true;
   try {
-    conversations.value = await api('/conversations');
+    conversations.value = await api<Conversation[]>('/conversations');
   } catch (e) {
-    error.value = e.message;
+    error.value = e instanceof Error ? e.message : 'خطا';
+  } finally {
+    conversationsLoading.value = false;
   }
 }
 
 async function loadModels() {
   try {
-    models.value = await api('/models');
-    const fallback = models.value.find((m) => m.isDefault) ?? models.value[0];
-    selectedModelId.value = fallback?.id ?? '';
+    models.value = await api<AiModel[]>('/models');
+    const fallback = models.value.find((model) => model.isDefault) ?? models.value[0];
+    if (fallback) selectedModelId.value = fallback.id;
   } catch {
     models.value = [];
   }
 }
 
-async function selectConversation(id) {
-  if (streaming.value) return;
-  activeConversationId.value = id;
+// ---- conversations ----
+async function selectConversation(id: string) {
+  if (id === activeId.value || streaming.value) return;
+  activeId.value = id;
   error.value = '';
   await loadMessages();
 }
 
+async function createConversation(): Promise<Conversation> {
+  const conversation = await api<Conversation>('/conversations', { method: 'POST', body: {} });
+  conversations.value.unshift(conversation);
+  activeId.value = conversation.id;
+  messages.value = [];
+  return conversation;
+}
+
 async function loadMessages() {
-  if (!activeConversationId.value) {
+  if (!activeId.value) {
     messages.value = [];
     return;
   }
-  loadingMessages.value = true;
+  messagesLoading.value = true;
   try {
-    const result = await api(`/conversations/${activeConversationId.value}`);
+    const result = await api<{ conversation: Conversation; messages: Message[] }>(
+      `/conversations/${activeId.value}`,
+    );
     messages.value = result.messages;
-    await scrollToBottom();
+    await scrollToBottom(true);
   } catch (e) {
-    error.value = e.message;
+    error.value = e instanceof Error ? e.message : 'خطا';
   } finally {
-    loadingMessages.value = false;
+    messagesLoading.value = false;
   }
 }
 
-async function createConversation() {
+function startNewConversation() {
   if (streaming.value) return;
-  try {
-    const conversation = await api('/conversations', { method: 'POST', body: {} });
-    conversations.value.unshift(conversation);
-    activeConversationId.value = conversation.id;
-    messages.value = [];
-    error.value = '';
-  } catch (e) {
-    error.value = e.message;
-  }
+  activeId.value = null;
+  messages.value = [];
 }
 
-async function send() {
-  const content = draft.value.trim();
-  if (!content || !activeConversationId.value || streaming.value) return;
-
+// ---- sending / streaming ----
+async function send(content: string) {
+  if (streaming.value) return;
   error.value = '';
-  streaming.value = true;
-  draft.value = '';
 
-  // Optimistic user bubble + streaming assistant placeholder.
-  const tempUserId = `temp-user-${Date.now()}`;
-  const streamingId = 'streaming-assistant';
-  messages.value.push({ id: tempUserId, role: 'user', content });
-  messages.value.push({ id: streamingId, role: 'assistant', content: '', streaming: true });
+  try {
+    if (!activeId.value) await createConversation();
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : 'ساخت گفتگو ناموفق بود.';
+    return;
+  }
+
+  const conversationId = activeId.value;
+  if (!conversationId) return;
+
+  const optimisticUser: Message = {
+    id: `local-${Date.now()}`,
+    conversationId,
+    role: 'user',
+    content,
+    status: null,
+    errorMessage: null,
+    modelId: null,
+    createdAt: new Date().toISOString(),
+  };
+  const placeholder: Message = {
+    id: STREAM_ID,
+    conversationId,
+    role: 'assistant',
+    content: '',
+    status: null,
+    errorMessage: null,
+    modelId: null,
+    createdAt: new Date().toISOString(),
+  };
+  messages.value.push(optimisticUser, placeholder);
+  streaming.value = true;
+  pinnedToBottom.value = true;
   await scrollToBottom();
 
   let accumulated = '';
-
-  const done = () => {
+  const finish = () => {
     streaming.value = false;
+    streamHandle.value = null;
+    void loadConversations(); // refresh titles and ordering
   };
 
-  streamChatMessage(activeConversationId.value, {
-    content,
-    modelId: selectedModelId.value || undefined,
-    onMeta: async ({ userMessage }) => {
-      const optimistic = messages.value.find((m) => m.id === tempUserId);
-      if (optimistic) Object.assign(optimistic, userMessage);
+  streamHandle.value = streamChatMessage(
+    conversationId,
+    { content, modelId: selectedModelId.value || undefined },
+    {
+      onMeta: ({ userMessage: persisted }) => {
+        const optimistic = messages.value.find((m) => m.id === optimisticUser.id);
+        if (optimistic) Object.assign(optimistic, persisted);
+        placeholder.modelId = persisted.modelId;
+      },
+      onDelta: ({ text }) => {
+        accumulated += text;
+        placeholder.content = accumulated;
+        void scrollToBottom();
+      },
+      onDone: ({ assistantMessage }) => {
+        // Promote the placeholder to the persisted message (real id/content).
+        Object.assign(placeholder, assistantMessage);
+        finish();
+      },
+      onError: (message) => {
+        // Keep the partial answer visible, marked as failed — the backend
+        // has already persisted it with status "error".
+        placeholder.id = `local-error-${Date.now()}`;
+        placeholder.status = 'error';
+        placeholder.errorMessage = message;
+        toast.error(message);
+        finish();
+      },
     },
-    onDelta: async ({ text }) => {
-      accumulated += text;
-      const bubble = messages.value.find((m) => m.id === streamingId);
-      if (bubble) bubble.content = accumulated;
-      await scrollToBottom();
-    },
-    onDone: async ({ assistantMessage }) => {
-      const bubble = messages.value.find((m) => m.id === streamingId);
-      if (bubble) Object.assign(bubble, assistantMessage, { streaming: false });
-      done();
-      refreshConversationList();
-    },
-    onError: async (message) => {
-      const bubble = messages.value.find((m) => m.id === streamingId);
-      if (bubble) {
-        bubble.streaming = false;
-        bubble.status = 'error';
-        bubble.errorMessage = message;
-        if (!bubble.content) bubble.content = '';
-      }
-      error.value = message;
-      done();
-      refreshConversationList();
-    },
-  });
+  );
 }
 
-async function refreshConversationList() {
-  // Title may have been auto-generated from the first message.
-  await loadConversations();
+function stopStreaming() {
+  streamHandle.value?.abort();
+  // The backend persists the partial answer; the error event finalizes the UI.
 }
 
-async function scrollToBottom() {
+// ---- scrolling: never yank the user back up ----
+const scroller = ref<HTMLElement | null>(null);
+const pinnedToBottom = ref(true);
+
+function onScroll() {
+  const element = scroller.value;
+  if (!element) return;
+  pinnedToBottom.value = element.scrollHeight - element.scrollTop - element.clientHeight < 120;
+}
+
+async function scrollToBottom(force = false) {
   await nextTick();
-  if (messagesEl.value) messagesEl.value.scrollTop = messagesEl.value.scrollHeight;
-}
-
-function logout() {
-  auth.clearAuth();
-  router.push({ name: 'login' });
-}
-
-function formatTime(iso) {
-  return new Date(iso).toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' });
+  const element = scroller.value;
+  if (element && (force || pinnedToBottom.value)) element.scrollTop = element.scrollHeight;
 }
 </script>
 
 <template>
-  <div class="chat-shell">
-    <aside class="sidebar">
-      <header>
-        <strong>چت هوشمند</strong>
-        <button class="secondary" @click="createConversation">+ گفتگوی جدید</button>
-      </header>
-      <nav class="conversation-list">
-        <button
-          v-for="conversation in conversations"
-          :key="conversation.id"
-          class="conversation-item"
-          :class="{ active: conversation.id === activeConversationId }"
-          :title="conversation.title"
-          @click="selectConversation(conversation.id)"
-        >
-          {{ conversation.title }}
-        </button>
-        <p v-if="conversations.length === 0" class="muted-link">
-          هنوز گفتگویی ندارید. یکی بسازید!
-        </p>
-      </nav>
-      <footer style="display: grid; gap: 0.4rem">
-        <p class="muted-link" style="margin: 0">{{ auth.state.user?.email }}</p>
-        <router-link v-if="auth.isAdmin()" to="/admin/models" class="muted-link">
-          پنل مدیریت مدل‌ها
-        </router-link>
-        <button class="secondary" @click="logout">خروج</button>
-      </footer>
-    </aside>
+  <div class="chat-page">
+    <Transition name="fade">
+      <div v-if="drawerOpen" class="chat-page__overlay" @click="drawerOpen = false"></div>
+    </Transition>
 
-    <main class="chat-main">
-      <header class="chat-header">
-        <strong>{{ activeConversation?.title ?? 'گفتگو را انتخاب کنید' }}</strong>
-        <div class="model-picker">
-          <label for="model">مدل:</label>
-          <select id="model" v-model="selectedModelId">
-            <option v-if="models.length === 0" value="" disabled>مدلی موجود نیست</option>
-            <option v-for="model in models" :key="model.id" :value="model.id">
-              {{ model.name }}{{ model.isDefault ? ' (پیش‌فرض)' : '' }}
-            </option>
-          </select>
-        </div>
-      </header>
+    <AppSidebar
+      :conversations="conversations"
+      :active-id="activeId"
+      :loading="conversationsLoading"
+      :open="drawerOpen"
+      @select="selectConversation"
+      @create="startNewConversation"
+      @close="drawerOpen = false"
+    />
 
-      <div ref="messagesEl" class="messages">
-        <div v-if="!activeConversationId" class="empty-state">
-          <h2>به چت هوشمند خوش آمدید 👋</h2>
-          <p>از نوار کنار یک گفتگوی جدید بسازید و اولین پیام را بفرستید.</p>
-        </div>
-        <p v-else-if="loadingMessages" class="empty-state">در حال بارگذاری…</p>
-        <template v-else>
-          <div
-            v-for="message in messages"
-            :key="message.id"
-            class="bubble"
-            :class="[message.role, { 'status-error': message.status === 'error' }]"
-          >
-            {{ message.content }}<span v-if="message.streaming" class="typing-dot"></span>
-            <span v-if="message.status === 'error' && message.errorMessage" class="bubble-tag">
-              ⚠️ {{ message.errorMessage }}
-            </span>
+    <main class="chat">
+      <ChatHeader
+        :title="activeConversation?.title ?? 'گفتگوی تازه'"
+        :models="models"
+        :model-id="selectedModelId"
+        @update:model-id="selectedModelId = $event"
+        @open-menu="drawerOpen = true"
+      />
+
+      <div ref="scroller" class="chat__messages" @scroll.passive="onScroll">
+        <EmptyChat v-if="!activeId && !conversationsLoading" @pick="send" />
+
+        <div v-else-if="messagesLoading" class="chat__loading" aria-label="در حال بارگذاری پیام‌ها">
+          <div v-for="row in 3" :key="row" class="chat__loading-row">
+            <AppSkeleton :lines="2" :width="row % 2 ? '60%' : '40%'" />
           </div>
-          <p v-if="messages.length === 0" class="empty-state">اولین پیام را بفرستید.</p>
-        </template>
+        </div>
+
+        <div v-else class="chat__stream">
+          <MessageItem
+            v-for="message in completedMessages"
+            :key="message.id"
+            :message="message"
+            :model-name="models.find((m) => m.id === message.modelId)?.name"
+          />
+          <MessageItem
+            v-if="streamingMessage"
+            :message="streamingMessage"
+            :model-name="activeModel?.name"
+            streaming
+          />
+        </div>
       </div>
 
-      <div v-if="error" class="error-banner" style="margin: 0 1.4rem">{{ error }}</div>
-
-      <form class="composer" @submit.prevent="send">
-        <textarea
-          v-model="draft"
-          placeholder="پیام خود را بنویسید…"
-          :disabled="!activeConversationId || streaming"
-          @keydown.enter.exact.prevent="send"
-        ></textarea>
-        <button type="submit" :disabled="!draft.trim() || !activeConversationId || streaming">
-          {{ streaming ? 'در حال پاسخ…' : 'ارسال' }}
-        </button>
-      </form>
+      <MessageComposer
+        :models="models"
+        :model-id="selectedModelId"
+        :streaming="streaming"
+        :hint="activeId ? '' : 'ارسال اولین پیام، گفتگو را به‌صورت خودکار می‌سازد.'"
+        @send="send"
+        @stop="stopStreaming"
+        @update:model-id="selectedModelId = $event"
+      />
     </main>
   </div>
 </template>
+
+<style scoped>
+.chat-page {
+  display: flex;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+.chat-page__overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-drawer-overlay);
+  background: color-mix(in srgb, var(--text-1) 30%, transparent);
+}
+
+.chat {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+
+.chat__messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.6rem 1.5rem;
+}
+
+.chat__stream {
+  display: grid;
+  gap: 1.3rem;
+  max-width: calc(var(--chat-measure) + 3rem);
+  margin-inline: auto;
+}
+
+.chat__loading {
+  max-width: calc(var(--chat-measure) + 3rem);
+  margin-inline: auto;
+  display: grid;
+  gap: 1.4rem;
+}
+
+.chat__loading-row {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity var(--motion-normal) var(--ease-out);
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+@media (max-width: 1023px) {
+  .chat__messages {
+    padding: 1.2rem 0.9rem;
+  }
+}
+</style>
