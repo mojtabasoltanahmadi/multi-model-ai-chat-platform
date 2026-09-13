@@ -4,7 +4,7 @@ A minimal, working MVP of a multi-model AI chat platform for Persian-speaking us
 register/login, own conversations, streamed AI responses, and admin-managed AI models.
 
 - **Backend**: NestJS + TypeORM + PostgreSQL (modular monolith, port 4000)
-- **Frontend**: Vue 3 + Vite (RTL Persian UI, port 5200)
+- **Frontend**: Vue 3 + TypeScript + Vite (RTL Persian UI, port 5200, light & dark themes)
 
 ## Quick Start
 
@@ -66,6 +66,7 @@ node ../scripts/smoke-test.mjs       # 48 end-to-end HTTP checks
 
 ## Documentation
 
+- [DESIGN_SYSTEM.md](DESIGN_SYSTEM.md) — visual source of truth: tokens, components, page patterns, decision log
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — modules, data model, invariants, error handling
 - [docs/API.md](docs/API.md) — endpoint reference and the SSE streaming protocol
 - [docs/STAGES.md](docs/STAGES.md) — implementation stages, decisions, edge cases, known limitations
@@ -78,10 +79,13 @@ node ../scripts/smoke-test.mjs       # 48 end-to-end HTTP checks
   return 404 (no existence leak).
 - Provider API keys are stored server-side and never returned by any API (`hasApiKey` flag only).
 - AI provider failures surface as generic client-facing messages; details stay in server logs.
+- AI markdown responses are rendered with raw HTML disabled (no script injection).
 
 ## Known limitations (deliberate MVP scope)
 
 - Schema via `DB_SYNCHRONIZE` instead of migrations (dev-only convenience, see docs/STAGES.md)
 - Access tokens only (no refresh tokens / logout blacklist)
 - API keys stored in plain text in the database (masked at the API boundary)
-- No rate limiting, file upload, Redis/queues, or observability stack — none are needed yet
+- Attachment button in the composer is visual-only (file upload intentionally out of MVP)
+- No regenerate-message action (requires a backend regenerate endpoint)
+- No rate limiting, Redis/queues, or observability stack — none are needed yet

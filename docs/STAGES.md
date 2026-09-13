@@ -100,6 +100,43 @@ A running log of what was built, the decisions taken, and how each stage was ver
 - Fresh reboot of both servers; backend direct 401 on protected route; Vite 200.
 - `npx jest`: 43/43. Smoke test direct: 48/48. Smoke test through Vite proxy: 48/48.
 
+## Stage 8 — UI/UX redesign: premium AI workspace (TypeScript)
+
+The frontend was rebuilt to a commercial-grade design system per the UI brief and the
+project's `UI_UX_RULES.md` / `DESIGN_SYSTEM.md` (backend untouched — all 48 API smoke
+checks still pass).
+
+- **TypeScript migration**: `vue-tsc` typecheck in `npm run build`; typed API layer
+  (`src/api/types.ts`, `client.ts`) and typed SFCs throughout.
+- **Design system**: layered CSS tokens (`src/styles/tokens.css`) — indigo accent,
+  warm off-white light theme, intentionally-designed cool near-black dark theme.
+  Theme preference (روشن/سیستم/تاریک) persisted, respects `prefers-color-scheme`,
+  applied pre-paint (no FOUC).
+- **Persian typography**: self-hosted Vazirmatn (@fontsource) + Inter for Latin
+  fragments; `.ltr`/`.mono` utilities keep mixed RTL/LTR content stable.
+- **Component library** (`ui/`): AppButton, AppInput (password reveal, validation),
+  AppModal, ToastHost, AppSkeleton, AppAvatar, ThemeToggle, BrandMark, EmptyState/ErrorState.
+- **Workspace layout** (`layout/AppSidebar.vue`): brand, new conversation, search,
+  date-grouped conversation list, profile menu (theme/admin/logout); off-canvas drawer
+  below 1024px.
+- **Chat experience** (`chat/`): glassy header with model selector, branded empty state
+  with 4 interactive prompt cards (create + send), markdown assistant messages with
+  model attribution/timestamps/copy action, streaming caret + stop button, composer with
+  autosize, focus ring, char counter, disabled attachment placeholder.
+- **Admin experience** (`admin/`): skeleton loading, retry error state, dense table
+  (cards on mobile), default/inactive visual states, modal form with provider radio
+  cards, delete confirmation, toasts for outcomes.
+- **Accessibility**: global `:focus-visible`, aria-live toasts, role=alert errors,
+  aria-current/expanded semantics, reduced-motion support, ≥44px touch targets.
+- **Deliberate MVP skips** (documented in DESIGN_SYSTEM.md decision log): regenerate
+  action (no backend endpoint), file upload (visual placeholder only), settings page
+  (profile menu covers theme/admin/logout).
+
+**Verification**: `vue-tsc --noEmit` clean, production build clean, dev server serves
+the new app (pre-paint theme script verified in HTML), backend 48/48 smoke checks pass
+through the Vite proxy. Browser GUI testing could not run in this session (browser
+automation runtime unavailable) — visual review pending a manual pass.
+
 ## Known limitations / future work
 
 - `DB_SYNCHRONIZE` schema management — replace with migrations before any real deployment.
