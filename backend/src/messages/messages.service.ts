@@ -51,7 +51,7 @@ export class MessagesService {
     modelId?: string,
   ): Promise<void> {
     await this.conversationsService.getOwned(userId, conversationId);
-    await this.modelsService.resolveChatModel(modelId);
+    await this.modelsService.resolveChatModel(modelId, 'free');
   }
 
   async streamChatTurn(
@@ -65,7 +65,7 @@ export class MessagesService {
     const { conversation, messages } =
       await this.conversationsService.getOwnedWithMessages(userId, conversationId);
 
-    const model = await this.modelsService.resolveChatModel(modelId);
+    const model = await this.modelsService.resolveChatModel(modelId, 'free');
 
     const userMessage = await this.messagesRepository.save(
       this.messagesRepository.create({

@@ -8,7 +8,7 @@ export class ModelsController {
   constructor(private readonly modelsService: ModelsService) {}
 
   @Get()
-  listActive(@CurrentUser() _user: { id: string }) {
-    return this.modelsService.listActive();
+  listAvailable(@CurrentUser() _user: { id: string }) {
+    return this.modelsService.listAvailable('free');
   }
 }
