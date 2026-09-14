@@ -66,6 +66,7 @@ node ../scripts/smoke-test.mjs       # 48 end-to-end HTTP checks
 
 ## Documentation
 
+- [docs/DESIGN.md](docs/DESIGN.md) — pre-development design for Task 1 (requirements, rules, invariants, scope, breakdown)
 - [DESIGN_SYSTEM.md](DESIGN_SYSTEM.md) — visual source of truth: tokens, components, page patterns, decision log
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — modules, data model, invariants, error handling
 - [docs/API.md](docs/API.md) — endpoint reference and the SSE streaming protocol
