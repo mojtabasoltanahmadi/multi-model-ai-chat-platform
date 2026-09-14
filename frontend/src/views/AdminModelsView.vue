@@ -236,7 +236,8 @@ function logout() {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 1rem;
+  gap: 0.6rem 1rem;
+  flex-wrap: wrap;
 }
 
 .admin__count {

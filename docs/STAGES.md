@@ -144,3 +144,22 @@ automation runtime unavailable) — visual review pending a manual pass.
 - API keys unencrypted at rest.
 - No rate limiting; no observability; k6 load test deliberately skipped (no requirement yet).
 - Frontend browser-level GUI testing not yet automated (API layer fully covered by smoke tests).
+
+## Stage 9 — Responsive hardening (320px–1440px)
+
+Content-driven audit across all views and components found 8 concrete issues, each
+fixed at the component level (no redesign, no new breakpoints — the existing
+640/768/900/1024 system was reused):
+
+1. Chat header title: `min-width: 0` so the ellipsis engages on narrow screens.
+2. Composer textarea: `min-width: 0` (intrinsic width previously pushed the composer
+   box past the viewport on mobile).
+3. Model-selector pill: name ellipsized at 8.5rem; dropdown viewport-capped.
+4. Modal panels: `max-height: calc(100dvh - 3rem)` + scrollable body.
+5. Admin toolbar: wraps instead of overflowing at 320px.
+6. Wide markdown tables: scroll inside the message column.
+7. Mobile hamburger + drawer close: 2.5rem touch targets.
+8. (Covered by 1–7: no horizontal overflow sources remain in audit.)
+
+Verification: `vue-tsc` clean, build clean, all 8 rules asserted in built CSS chunks,
+48/48 API smoke checks still pass. Rules documented in DESIGN_SYSTEM.md §16.

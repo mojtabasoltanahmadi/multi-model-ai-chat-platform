@@ -86,6 +86,9 @@ onBeforeUnmount(() => {
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-overlay);
   outline: none;
+  /* Tall dialogs (e.g. the model form) must stay reachable on small screens. */
+  max-height: calc(100dvh - 3rem);
+  overflow-y: auto;
 }
 
 .app-modal__panel--sm {

@@ -186,6 +186,9 @@ defineExpose({ focus: () => textarea.value?.focus() });
 
 .composer__input {
   flex: 1;
+  /* A textarea's intrinsic width (default cols) otherwise forces the whole
+     composer box past narrow viewports. */
+  min-width: 0;
   min-height: 2.3rem;
   max-height: 11rem;
   padding: 0.4rem 0.2rem;

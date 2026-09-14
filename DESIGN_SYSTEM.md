@@ -321,6 +321,22 @@ Auth split:   two panels >900px · single column below
 Composer:     compact padding, always within thumb reach
 ```
 
+**Overflow & touch rules** (verified against 320px):
+
+* Flex items that truncate (`text-overflow: ellipsis`) must also set `min-width: 0`
+  (chat header title) or an explicit `max-width` (model-selector name) — otherwise the
+  ellipsis never engages.
+* The composer textarea sets `min-width: 0` so its intrinsic width cannot push the
+  composer box past the viewport.
+* Dropdown menus are viewport-capped (`max-width: calc(100vw - 2rem)`).
+* Modals are height-capped (`max-height: calc(100dvh - 3rem)`, scrollable body) so tall
+  forms stay reachable on small screens.
+* Wide markdown tables scroll inside the message column (`display: block;
+  overflow-x: auto`) instead of stretching the page.
+* Mobile-only navigation controls (hamburger, drawer close) use ≥2.5rem touch targets.
+* Toolbars wrap (`flex-wrap: wrap`) rather than overflow (admin toolbar).
+* Never mask layout bugs with a global `overflow-x: hidden`.
+
 ---
 
 # 17. Iconography

@@ -175,6 +175,15 @@ onBeforeUnmount(() => {
   font-weight: 700;
 }
 
+.model-selector__name {
+  /* Long model names must ellipsize instead of widening the pill past the
+     header/composer row on narrow screens. */
+  max-width: 8.5rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .model-selector__chevron {
   color: var(--text-3);
   transition: rotate var(--motion-fast) var(--ease-out);
@@ -189,6 +198,8 @@ onBeforeUnmount(() => {
   inset-inline-start: 0;
   z-index: var(--z-dropdown);
   min-width: 17rem;
+  /* Never let the dropdown extend past the viewport on small screens. */
+  max-width: calc(100vw - 2rem);
   max-height: 18rem;
   overflow-y: auto;
   margin: 0;

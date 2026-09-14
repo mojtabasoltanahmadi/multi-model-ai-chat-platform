@@ -248,6 +248,10 @@ async function copy() {
   border-collapse: collapse;
   font-size: 0.82rem;
   margin: 0.6rem 0;
+  /* Wide markdown tables scroll inside the message column instead of
+     stretching the page horizontally. */
+  display: block;
+  overflow-x: auto;
 }
 
 .message__content :deep(th),

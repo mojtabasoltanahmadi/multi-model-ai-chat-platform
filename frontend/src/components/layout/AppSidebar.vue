@@ -624,8 +624,8 @@ function onCreate() {
   .sidebar__close-drawer {
     display: grid;
     place-items: center;
-    width: 2rem;
-    height: 2rem;
+    width: 2.5rem;
+    height: 2.5rem;
     background: transparent;
     border: none;
     border-radius: var(--radius-xs);
