@@ -68,16 +68,36 @@ export class MessagesService {
 
   /**
    * Pre-flight for a chat turn: throws the proper HTTP error (404/400) if the
-   * conversation is unknown/not owned or the model is invalid/inactive.
-   * Runs before the SSE response starts, so errors reach the client as JSON.
+   * conversation is unknown/not owned, the model is invalid/inactive, or the
+   * idempotency key collides with a different message body. Runs before the
+   * SSE response starts, so errors reach the client as JSON.
    */
   async assertChatTurnAllowed(
     userId: string,
     conversationId: string,
     modelId?: string,
+    idempotency?: { clientMessageId?: string; content: string },
   ): Promise<void> {
     await this.conversationsService.getOwned(userId, conversationId);
     await this.modelsService.resolveChatModel(modelId, 'free');
+
+    if (idempotency?.clientMessageId) {
+      const existing = await this.messagesRepository.findOne({
+        where: {
+          conversationId,
+          role: 'user',
+          clientMessageId: idempotency.clientMessageId,
+        },
+      });
+      if (existing && existing.content !== idempotency.content) {
+        // Same intent id but different text — most likely a client bug.
+        // Caught here (before the SSE headers are flushed) so the client
+        // gets a normal HTTP 400, not an opaque SSE error mid-stream.
+        throw new BadRequestException(
+          'این پیام قبلاً با متن دیگری ارسال شده است.',
+        );
+      }
+    }
   }
 
   /**
@@ -131,6 +151,9 @@ export class MessagesService {
     const model = await this.modelsService.resolveChatModel(modelId, 'free');
 
     // ---- Idempotency: reuse the original user row if this is a retry. ----
+    // Content-collision with the same clientMessageId was already rejected
+    // by assertChatTurnAllowed; if we still find a match here, its content
+    // matches and this is a genuine replay.
     let userMessage: Message;
     let replay = false;
     if (clientMessageId) {
@@ -142,12 +165,6 @@ export class MessagesService {
         },
       });
       if (replayMatch) {
-        if (replayMatch.content !== content) {
-          // Same intent id but different text — most likely a client bug.
-          throw new BadRequestException(
-            'این پیام قبلاً با متن دیگری ارسال شده است.',
-          );
-        }
         userMessage = replayMatch;
         replay = true;
       } else {

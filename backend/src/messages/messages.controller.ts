@@ -45,10 +45,6 @@ export class MessagesController {
     @Req() request: Request,
     @Res() response: Response,
   ): Promise<void> {
-    // Validate ownership and model availability BEFORE opening the SSE stream,
-    // so these errors reach the client as normal JSON errors.
-    await this.messagesService.assertChatTurnAllowed(user.id, conversationId, dto.modelId);
-
     // Idempotency-Key header mirrors clientMessageId (defense-in-depth: lets
     // proxies / future replay logs correlate without parsing the body).
     const clientMessageId =
@@ -56,6 +52,14 @@ export class MessagesController {
       (typeof request.headers['idempotency-key'] === 'string'
         ? request.headers['idempotency-key']
         : undefined);
+
+    // Validate ownership, model availability, and idempotency BEFORE opening
+    // the SSE stream, so these errors reach the client as normal JSON errors
+    // (rather than being swallowed into a generic SSE error event).
+    await this.messagesService.assertChatTurnAllowed(user.id, conversationId, dto.modelId, {
+      clientMessageId,
+      content: dto.content.trim(),
+    });
 
     // Nest defaults POST to 201; an SSE stream is a normal 200 response.
     response.status(HttpStatus.OK);

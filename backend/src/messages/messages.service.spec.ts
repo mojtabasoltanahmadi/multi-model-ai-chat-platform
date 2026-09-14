@@ -5,7 +5,11 @@ import { createMockRepository } from '../test/mocks';
 describe('MessagesService.streamChatTurn', () => {
   let service: MessagesService;
   let messagesRepository: ReturnType<typeof createMockRepository>;
-  let conversationsService: { getOwnedWithMessages: jest.Mock; renameTitle: jest.Mock };
+  let conversationsService: {
+    getOwned: jest.Mock;
+    getOwnedWithMessages: jest.Mock;
+    renameTitle: jest.Mock;
+  };
   let modelsService: { resolveChatModel: jest.Mock };
   let aiProviderService: { streamChat: jest.Mock };
 
@@ -19,6 +23,7 @@ describe('MessagesService.streamChatTurn', () => {
     existingUserByClientMid?: { id: string; content: string } | null;
   } = {}) => {
     conversationsService = {
+      getOwned: jest.fn().mockResolvedValue({ id: 'conv-1', userId: 'user-1', title }),
       getOwnedWithMessages: jest.fn().mockResolvedValue({
         conversation: { id: 'conv-1', userId: 'user-1', title },
         messages: history,
@@ -354,22 +359,35 @@ describe('MessagesService.streamChatTurn', () => {
     expect(cb.onMeta.mock.calls[0][3]).toBe(true);
   });
 
-  it('rejects a retry whose content does not match the original user row', async () => {
+  it('rejects a retry whose content does not match the original user row (pre-flight)', async () => {
     setup({
       existingUserByClientMid: { id: 'cmid-1', content: 'متن اصلی' },
     });
 
+    // The content-collision check runs in assertChatTurnAllowed (before the
+    // SSE headers are flushed), so it surfaces as a normal HTTP 400.
     await expect(
-      service.streamChatTurn(
-        'user-1',
-        'conv-1',
-        'متن متفاوت',
-        undefined,
-        'cmid-1',
-        () => false,
-        callbacks(),
-      ),
+      service.assertChatTurnAllowed('user-1', 'conv-1', undefined, {
+        clientMessageId: 'cmid-1',
+        content: 'متن متفاوت',
+      }),
     ).rejects.toThrow(BadRequestException);
+
+    // A matching-content replay is allowed by the pre-flight (replay happens
+    // inside streamChatTurn).
+    await expect(
+      service.assertChatTurnAllowed('user-1', 'conv-1', undefined, {
+        clientMessageId: 'cmid-1',
+        content: 'متن اصلی',
+      }),
+    ).resolves.toBeUndefined();
+
+    // No idempotency key at all → no validation, no throw.
+    await expect(
+      service.assertChatTurnAllowed('user-1', 'conv-1', undefined, {
+        content: 'متن اصلی',
+      }),
+    ).resolves.toBeUndefined();
   });
 
   it('creates a fresh user row when clientMessageId does not match anything', async () => {

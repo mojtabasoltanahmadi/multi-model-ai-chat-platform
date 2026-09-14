@@ -41,26 +41,41 @@ async function api(method, path, { token, body } = {}) {
   return { status: response.status, json };
 }
 
-/** Reads an SSE stream and returns { events, deltas, finalEvent }. */
-async function streamMessage(token, conversationId, body) {
+/** Reads an SSE stream and returns { status, events, deltas, finalEvent }. */
+async function streamMessage(token, conversationId, body, { headers = {} } = {}) {
   const response = await fetch(`${BASE}/conversations/${conversationId}/messages`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+      ...headers,
+    },
     body: JSON.stringify(body),
   });
   const text = await response.text();
-  const events = [];
-  for (const block of text.split('\n\n').filter(Boolean)) {
-    const lines = block.split('\n');
-    const event = lines.find((l) => l.startsWith('event: '))?.slice(7);
-    const data = lines.find((l) => l.startsWith('data: '))?.slice(6);
-    if (event && data) events.push({ event, data: JSON.parse(data) });
+  // SSE error responses (e.g. 400, 404) carry a JSON body instead of events.
+  let events = [];
+  let errorJson = null;
+  if (text.trimStart().startsWith('{')) {
+    try {
+      errorJson = JSON.parse(text);
+    } catch {
+      /* fall through */
+    }
+  } else {
+    for (const block of text.split('\n\n').filter(Boolean)) {
+      const lines = block.split('\n');
+      const event = lines.find((l) => l.startsWith('event: '))?.slice(7);
+      const data = lines.find((l) => l.startsWith('data: '))?.slice(6);
+      if (event && data) events.push({ event, data: JSON.parse(data) });
+    }
   }
   return {
     status: response.status,
     events,
     deltas: events.filter((e) => e.event === 'delta').map((e) => e.data.text),
     finalEvent: events.at(-1)?.event,
+    errorJson,
   };
 }
 
@@ -317,6 +332,20 @@ async function main() {
   });
   check('stream responds with SSE (200)', stream.status === 200);
   check('stream starts with meta event', stream.events[0]?.event === 'meta');
+  check('meta carries userMessage with the persisted content', stream.events[0]?.data.userMessage.content === 'سلام، این یک پیام تستی است 🌟');
+  // Pre-persist invariant: assistant row is written with status='pending' BEFORE
+  // any delta is emitted — the meta event carries that real id so the
+  // frontend can already address it on a reload.
+  const metaAssistant = stream.events[0]?.data.assistantMessage;
+  check(
+    'meta carries assistantMessage with status=pending and a real id',
+    metaAssistant?.status === 'pending'
+      && typeof metaAssistant.id === 'string'
+      && metaAssistant.id.length > 0
+      && metaAssistant.content === '',
+  );
+  check('meta carries replay=false on a fresh turn', stream.events[0]?.data.replay === false);
+  check('meta carries the model used for this turn', stream.events[0]?.data.model?.id);
   check('stream delivers multiple deltas', stream.deltas.length > 3, `${stream.deltas.length} deltas`);
   check('stream preserves Persian UTF-8 + emoji', stream.events[0]?.data.userMessage.content === 'سلام، این یک پیام تستی است 🌟');
   check('stream ends with done event', stream.finalEvent === 'done');
@@ -356,11 +385,67 @@ async function main() {
   const failingConvAfter = await api('GET', `/conversations/${failingConv.json.id}`, { token: userToken });
   const failedAssistant = failingConvAfter.json.messages.filter((m) => m.role === 'assistant');
   check('failed turn still persists exactly ONE assistant message', failedAssistant.length === 1);
-  check('failed assistant message marked status=error', failedAssistant[0]?.status === 'error');
+  check('failed assistant message marked status=failed', failedAssistant[0]?.status === 'failed');
+  check('failed assistant keeps any partial content', typeof failedAssistant[0]?.content === 'string');
+  check('failed assistant has an internal errorMessage for ops', typeof failedAssistant[0]?.errorMessage === 'string' && failedAssistant[0].errorMessage.length > 0);
   check('internal provider error detail not exposed to client', !JSON.stringify(failingStream.events).includes('unreachable'));
 
-  // restore mock as default
+  // ---------- Idempotency (clientMessageId + Idempotency-Key header) ----------
+  // restore mock as default first so we can stream again
   await api('POST', `/admin/models/${modelB.id}/default`, { token: adminToken });
+  const idemConv = await api('POST', '/conversations', { token: userToken, body: {} });
+
+  // clientMessageId in body
+  const cmid1 = `smoke-cmid-${unique}`;
+  const idem1 = await streamMessage(userToken, idemConv.json.id, {
+    content: 'پیام idempotent اول',
+    clientMessageId: cmid1,
+  });
+  check('idem turn 1 completes', idem1.finalEvent === 'done' && idem1.events[0]?.data.replay === false);
+
+  // Same clientMessageId + same content → reuse user row, NEW assistant row.
+  const idem2 = await streamMessage(userToken, idemConv.json.id, {
+    content: 'پیام idempotent اول',
+    clientMessageId: cmid1,
+  });
+  check('idem retry emits replay=true', idem2.events[0]?.data.replay === true);
+  check('idem retry reuses userMessage id', idem2.events[0]?.data.userMessage.id === idem1.events[0]?.data.userMessage.id);
+  check('idem retry creates a NEW assistant row id', idem2.events[0]?.data.assistantMessage.id !== idem1.events[0]?.data.assistantMessage.id);
+
+  // Same clientMessageId + DIFFERENT content → client bug, 400.
+  const idemConflict = await streamMessage(userToken, idemConv.json.id, {
+    content: 'متن متفاوت',
+    clientMessageId: cmid1,
+  });
+  check('idem conflict (same id, different content) rejected (400)', idemConflict.status === 400);
+
+  // Idempotency-Key header is accepted as a fallback for clientMessageId.
+  const cmid2 = `smoke-cmid-${unique}-header`;
+  const idemHeader = await streamMessage(
+    userToken,
+    idemConv.json.id,
+    { content: 'پیام از طریق هدر' },
+    { headers: { 'Idempotency-Key': cmid2 } },
+  );
+  check('Idempotency-Key header accepted (final event done)', idemHeader.finalEvent === 'done');
+  // A second turn with the same header should reuse the user row too.
+  const idemHeader2 = await streamMessage(
+    userToken,
+    idemConv.json.id,
+    { content: 'پیام از طریق هدر' },
+    { headers: { 'Idempotency-Key': cmid2 } },
+  );
+  check('Idempotency-Key header replay=true on second send', idemHeader2.events[0]?.data.replay === true);
+
+  // Persisted state: 1 user row + 4 assistant rows (first idem turn + first
+  // header turn + 2 retries; idemConflict rejected before persistence).
+  const idemConvAfter = await api('GET', `/conversations/${idemConv.json.id}`, { token: userToken });
+  const idemUsers = idemConvAfter.json.messages.filter((m) => m.role === 'user');
+  const idemAssistants = idemConvAfter.json.messages.filter((m) => m.role === 'assistant');
+  check('idem: exactly 2 user rows persisted (one per distinct intent)', idemUsers.length === 2);
+  check('idem: 4 assistant rows persisted (1 per turn)', idemAssistants.length === 4);
+  check('idem: every assistant row reaches a terminal status', idemAssistants.every((m) => ['completed', 'failed', 'interrupted'].includes(m.status)));
+  check('idem: user rows carry their clientMessageId back', idemUsers.every((m) => typeof m.clientMessageId === 'string'));
 
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed > 0 ? 1 : 0);
