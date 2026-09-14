@@ -16,10 +16,17 @@ interface Props {
   loading?: boolean;
   /** Drawer mode on small screens. */
   open?: boolean;
+  /** Desktop-only: collapsed to a narrow rail. Ignored by the mobile drawer. */
+  collapsed?: boolean;
 }
 
 const props = defineProps<Props>();
-const emit = defineEmits<{ select: [id: string]; create: []; close: [] }>();
+const emit = defineEmits<{
+  select: [id: string];
+  create: [];
+  close: [];
+  toggleCollapse: [];
+}>();
 
 const router = useRouter();
 const auth = useAuth();
@@ -123,11 +130,36 @@ function onCreate() {
 </script>
 
 <template>
-  <aside class="sidebar" :class="{ 'sidebar--open': open }" aria-label="فهرست گفتگوها">
+  <aside
+    id="chat-sidebar"
+    class="sidebar"
+    :class="{ 'sidebar--open': open, 'sidebar--collapsed': collapsed }"
+    aria-label="فهرست گفتگوها"
+  >
     <div class="sidebar__inner">
       <header class="sidebar__brand">
-        <BrandMark :size="30" />
-        <div class="sidebar__brand-text">
+        <button
+          type="button"
+          class="sidebar__toggle"
+          aria-label="باز و بسته کردن فهرست گفتگوها"
+          :aria-expanded="!collapsed"
+          aria-controls="chat-sidebar"
+          @click="emit('toggleCollapse')"
+        >
+          <!-- Panel icon; mirrored for RTL so the divider hugs the sidebar edge. -->
+          <svg v-if="!collapsed" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <rect x="3" y="3" width="18" height="18" rx="2.5" />
+            <path d="M9 3v18" />
+            <path d="m16 15-3-3 3-3" />
+          </svg>
+          <svg v-else width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <rect x="3" y="3" width="18" height="18" rx="2.5" />
+            <path d="M9 3v18" />
+            <path d="m13 9 3 3-3 3" />
+          </svg>
+        </button>
+        <BrandMark v-if="!collapsed" :size="30" />
+        <div v-if="!collapsed" class="sidebar__brand-text">
           <strong>هوش‌یار</strong>
           <span>دستیار هوشمند شما</span>
         </div>
@@ -258,6 +290,7 @@ function onCreate() {
   padding: 1rem 0.9rem;
   background: var(--surface);
   border-inline-end: 1px solid var(--border);
+  overflow: hidden;
 }
 
 /* Brand */
@@ -501,6 +534,76 @@ function onCreate() {
 .sidebar-pop-leave-to {
   opacity: 0;
   transform: translateY(6px);
+}
+
+/* Collapse toggle — desktop only; mobile uses the drawer controls. */
+.sidebar__toggle {
+  display: none;
+  place-items: center;
+  width: 2.2rem;
+  height: 2.2rem;
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  transition:
+    background var(--motion-fast) var(--ease-out),
+    color var(--motion-fast) var(--ease-out);
+}
+
+.sidebar__toggle:hover {
+  background: var(--surface-2);
+  color: var(--text-1);
+}
+
+/* Mirror the panel icon so its divider hugs the sidebar edge in RTL. */
+[dir='rtl'] .sidebar__toggle svg {
+  transform: scaleX(-1);
+}
+
+/* Elements hidden while collapsed; visibility removes them from tab order
+   and the accessibility tree, flipping discretely with the fade. */
+.sidebar__brand-text,
+.sidebar__actions,
+.sidebar__list,
+.sidebar__profile {
+  transition:
+    opacity var(--motion-fast) var(--ease-out),
+    visibility var(--motion-fast);
+}
+
+/* Collapsed rail (desktop only — the mobile drawer ignores collapse state). */
+@media (min-width: 1024px) {
+  .sidebar__toggle {
+    display: grid;
+  }
+
+  .sidebar {
+    transition: width var(--motion-normal) var(--ease-out);
+  }
+
+  .sidebar--collapsed {
+    width: var(--sidebar-collapsed-width);
+  }
+
+  .sidebar--collapsed .sidebar__inner {
+    padding-inline: 0.4rem;
+  }
+
+  .sidebar--collapsed .sidebar__brand {
+    justify-content: center;
+    padding-inline: 0;
+  }
+
+  .sidebar--collapsed .sidebar__brand-text,
+  .sidebar--collapsed .sidebar__actions,
+  .sidebar--collapsed .sidebar__list,
+  .sidebar--collapsed .sidebar__profile,
+  .sidebar--collapsed :deep(.brand-mark) {
+    opacity: 0;
+    visibility: hidden;
+  }
 }
 
 /* Drawer (mobile/tablet) — inline-start is the natural sidebar edge in both directions. */

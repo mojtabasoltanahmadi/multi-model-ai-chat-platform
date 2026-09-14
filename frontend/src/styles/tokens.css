@@ -53,6 +53,7 @@
 
   /* ---- Layout ---- */
   --sidebar-width: 288px;
+  --sidebar-collapsed-width: 3.5rem;
   --chat-measure: 46rem;
   --content-max: 64rem;
 

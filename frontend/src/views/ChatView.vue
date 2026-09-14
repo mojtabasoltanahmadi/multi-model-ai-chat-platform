@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref } from 'vue';
+import { computed, nextTick, onMounted, ref, watch } from 'vue';
 import AppSidebar from '../components/layout/AppSidebar.vue';
 import ChatHeader from '../components/chat/ChatHeader.vue';
 import EmptyChat from '../components/chat/EmptyChat.vue';
@@ -22,6 +22,26 @@ const models = ref<AiModel[]>([]);
 const selectedModelId = ref('');
 const drawerOpen = ref(false);
 const error = ref('');
+
+/** Desktop collapse state (ChatGPT-style rail); persisted per machine. */
+const sidebarCollapsed = ref(readCollapsedPreference());
+
+function readCollapsedPreference(): boolean {
+  try {
+    // Strict comparison: any invalid stored value falls back to expanded.
+    return localStorage.getItem('hooshyar.sidebar-collapsed') === 'true';
+  } catch {
+    return false;
+  }
+}
+
+watch(sidebarCollapsed, (value) => {
+  try {
+    localStorage.setItem('hooshyar.sidebar-collapsed', String(value));
+  } catch {
+    /* storage unavailable (private mode) — keep state in memory only */
+  }
+});
 
 // streaming placeholder id inside the messages list
 const STREAM_ID = '__streaming__';
@@ -219,9 +239,11 @@ async function scrollToBottom(force = false) {
       :active-id="activeId"
       :loading="conversationsLoading"
       :open="drawerOpen"
+      :collapsed="sidebarCollapsed"
       @select="selectConversation"
       @create="startNewConversation"
       @close="drawerOpen = false"
+      @toggle-collapse="sidebarCollapsed = !sidebarCollapsed"
     />
 
     <main class="chat">

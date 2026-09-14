@@ -147,6 +147,7 @@ introduce arbitrary values.
 ```text
 Header height:      3.6rem (chat header, glassy translucent)
 Sidebar width:      var(--sidebar-width) = 288px
+Sidebar collapsed:  var(--sidebar-collapsed-width) = 56px (rail with toggle)
 Chat measure:       var(--chat-measure) = 46rem (message column)
 Admin content max:  62rem
 Page padding:       1.5rem desktop / 0.9rem mobile
@@ -256,6 +257,16 @@ Sidebar is the primary navigation and behaves identically across pages: on the c
 lists conversations; the profile menu contains theme/admin/logout. Admin pages keep a
 visible «بازگشت به چت» action. Mobile keeps navigation reachable via the header menu
 button (drawer) — navigation is never hidden entirely.
+
+**Collapsible sidebar (desktop ≥1024px)**: the panel-top toggle in the sidebar header
+collapses it to a 56px rail (width transition, 200ms ease-out; hidden content fades out
+via opacity + visibility, which also removes it from tab order and the accessibility
+tree). `aria-expanded` on the toggle reflects the state; the aside carries the stable
+`id="chat-sidebar"` referenced by `aria-controls`. State persists in localStorage
+(`hooshyar.sidebar-collapsed`, strict-parse so invalid values fall back to expanded).
+Collapse does not apply below 1024px — there the sidebar is an overlay drawer and keeps
+its own open/close controls. In RTL the panel icon is mirrored (`scaleX(-1)`) so its
+divider hugs the sidebar edge.
 
 ---
 
@@ -381,6 +392,14 @@ Decision: Inline SVG icons instead of an icon library
 Reason:   Fewer than 20 icons needed; zero dependencies; consistent stroke system.
 Date:     2026-09-13
 Affected: all components.
+
+Decision: Sidebar collapse (desktop) is width-transition to a 56px rail; content hides
+          via opacity+visibility; mobile drawer ignores collapse state entirely.
+Reason:   Matches the ChatGPT-style interaction the product brief asks for; visibility
+          (not display:none) lets content fade during the transition while still leaving
+          the tab order; media-query scoping guarantees the mobile drawer never regresses.
+Date:     2026-09-14
+Affected: AppSidebar.vue, ChatView.vue, tokens.css.
 
 Decision: Vazirmatn primary + Inter for Latin fragments
 Reason:   Excellent Persian readability; Inter keeps emails/ids crisp; both
