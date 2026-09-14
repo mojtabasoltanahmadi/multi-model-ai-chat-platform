@@ -58,10 +58,10 @@ The Vite dev server proxies `/api` to `http://localhost:4000`, so no CORS setup 
 
 ```bash
 cd backend
-npx jest                    # 43 unit tests (no database needed)
+npx jest                    # 55 unit tests (no database needed)
 
 # with the backend running:
-node ../scripts/smoke-test.mjs       # 48 end-to-end HTTP checks
+node ../scripts/smoke-test.mjs       # 58 end-to-end HTTP checks
 ```
 
 ## Documentation
@@ -81,6 +81,10 @@ node ../scripts/smoke-test.mjs       # 48 end-to-end HTTP checks
 - Provider API keys are stored server-side and never returned by any API (`hasApiKey` flag only).
 - AI provider failures surface as generic client-facing messages; details stay in server logs.
 - AI markdown responses are rendered with raw HTML disabled (no script injection).
+- Free-plan model access is enforced server-side: `GET /models` returns only active+free
+  models, and every chat send re-verifies that the requested (or default) model is active
+  and allowed for the caller's plan — hiding models in the UI is never the authorization
+  mechanism (see docs/ARCHITECTURE.md → Free-model access & plan authorization).
 
 ## Known limitations (deliberate MVP scope)
 

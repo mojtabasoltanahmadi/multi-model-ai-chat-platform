@@ -45,6 +45,8 @@ export interface AiModel {
   externalModelId: string;
   baseUrl: string | null;
   isActive: boolean;
+  /** Available to users on the FREE plan (independent of isActive). */
+  isFree: boolean;
   isDefault: boolean;
   createdAt: string;
   hasApiKey: boolean;
@@ -62,6 +64,7 @@ export interface CreateModelPayload {
   baseUrl?: string;
   apiKey?: string;
   isActive?: boolean;
+  isFree?: boolean;
 }
 
 export interface UpdateModelPayload {
@@ -71,4 +74,5 @@ export interface UpdateModelPayload {
   baseUrl?: string | null;
   apiKey?: string;
   isActive?: boolean;
+  isFree?: boolean;
 }

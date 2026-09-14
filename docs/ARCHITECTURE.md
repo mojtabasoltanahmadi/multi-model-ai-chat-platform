@@ -25,7 +25,7 @@ messages(id, conversation_id → conversations, role,    role ∈ {user, assista
          content, status, error_message, model_id,     status ∈ {completed, error} |
          timestamps)                                   null for user messages
 ai_models(id, name, provider, external_model_id,       provider ∈ {mock, openai-compatible}
-          base_url, api_key, is_active, is_default)
+          base_url, api_key, is_active, is_free, is_default)
 ```
 
 Foreign keys use `ON DELETE CASCADE` from messages→conversations→users, and
@@ -62,6 +62,33 @@ An assistant row is created once per turn and mutated in memory while streaming:
 Whatever the outcome, exactly one assistant row is persisted. The UI shows
 `⚠️ errorMessage` on error-status bubbles, keeping partial + error distinguishable.
 
+## Free-model access & plan authorization
+
+The MVP has a single FREE plan (`UserPlan = 'free'`), but the authorization chokepoint is
+already plan-aware. Access to a model = **active AND allowed for the caller's plan**
+(`isFree = true` for the FREE plan). `isFree` and `isActive` are independent: a model can
+be free-configured but temporarily disabled (hidden from the picker, not usable).
+
+- `GET /models` returns only models the **caller's plan** may use — never the full catalog.
+  Hiding models in the frontend is UX, not authorization.
+- `ModelsService.resolveChatModel(modelId?, plan)` is the single chokepoint for chat:
+  the requested (or default) model must exist (404), be active (400), and be allowed for
+  the plan (403). It re-reads current backend state on **every send**, so a model disabled
+  or un-freed after the user selected it is rejected on the next message — a stale frontend
+  selector or direct API tampering cannot bypass it (concurrent admin changes are honored).
+- The default model must always be **active + free**: `setDefault` refuses inactive or
+  non-free models; deactivating/un-freeing/deleting the default is refused; the bootstrap
+  auto-default only picks an active+free model. Free users therefore always have a valid
+  default to fall back on.
+
+## Model switching & per-message attribution
+
+The model is stored **per assistant message** (`messages.model_id`), not per conversation.
+Switching models mid-conversation only affects new turns; history is never rewritten.
+Each assistant message remains attributable to the model that produced it (the SSE `meta`
+and `done` events include `modelId`; the FK is `SET NULL` if the model is later deleted,
+which preserves history).
+
 ## Security model
 
 - **Secure by default**: `JwtAuthGuard` and `RolesGuard` are global. Routes opt OUT with
@@ -80,13 +107,16 @@ Whatever the outcome, exactly one assistant row is persisted. The UI shows
 
 ## Default-model invariant
 
-At most one default model exists and it must be active:
+At most one default model exists and it must be **active and free**:
 
-- `setDefault` swaps in a transaction (clear all → set one).
-- Creating the first active model auto-assigns default (bootstrap convenience).
-- Deactivating/deleting the default is refused (400) until another model is default.
-- Chat falls back to the default only if it exists and is active; inactive or unknown
-  model ids are rejected before any message is persisted.
+- `setDefault` swaps in a transaction (clear all → set one); inactive or non-free models
+  are refused (400).
+- Creating the first active+free model auto-assigns default (bootstrap convenience).
+- Deactivating, un-freeing, or deleting the default is refused (400) until another model
+  is default.
+- Chat falls back to the default only if it exists, is active, and is allowed for the
+  caller's plan; inactive, unknown, or unauthorized model ids are rejected before any
+  message is persisted.
 
 ## Deliberate MVP trade-offs
 

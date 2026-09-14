@@ -313,12 +313,15 @@ paths:
   /models:
     get:
       tags: [Models]
-      operationId: listActiveModels
-      summary: List active models for the chat picker
+      operationId: listAvailableModels
+      summary: List models available to the caller's plan
       description: |
-        Returns models with `isActive = true` only — inactive models are
-        never usable for a new chat turn (INV-4). Provider API keys are
-        never included in any model response.
+        Plan-filtered for the chat picker: only models the caller is
+        authorized to use — currently `isActive = true` AND `isFree = true`
+        (the FREE plan is the only plan in the MVP). Inactive or premium
+        models are never included; the backend is the authorization source
+        of truth, not the frontend. Provider API keys are never included in
+        any model response.
       responses:
         '200':
           description: Active model collection (may be empty).
@@ -407,8 +410,9 @@ paths:
       summary: Update a model (admin)
       description: |
         Partial update; unknown fields are rejected. Sending `isActive:
-        false` for the current default model is refused (BR-6) until another
-        model is made default first. At least one field must be provided.
+        false` or `isFree: false` for the current default model is refused
+        (BR-6) until another model is made default first — the default must
+        stay active AND free. At least one field must be provided.
       parameters:
         - $ref: '#/components/parameters/ModelId'
       requestBody:
@@ -731,12 +735,17 @@ components:
         modelId:
           type: string
           format: uuid
-          description: Optional; must reference an **active** model. Omit to use the default model.
+          description: |
+            Optional; must reference a model that is active and allowed for
+            the caller's plan (active + free for FREE-plan users). Omit to
+            use the default model. Authorization is re-verified on every
+            send; a premium model requested by a FREE user is rejected with
+            403 even via direct API calls.
 
     # ---- Models ----
     AiModel:
       type: object
-      required: [id, name, provider, externalModelId, baseUrl, isActive, isDefault, hasApiKey, createdAt]
+      required: [id, name, provider, externalModelId, baseUrl, isActive, isFree, isDefault, hasApiKey, createdAt]
       properties:
         id:
           type: string
@@ -758,9 +767,14 @@ components:
           description: OpenAI-compatible base URL; `null` uses the provider default.
         isActive:
           type: boolean
+        isFree:
+          type: boolean
+          description: |
+            Whether the model may be used by FREE-plan users. Independent of
+            `isActive`: a free-configured model can be temporarily disabled.
         isDefault:
           type: boolean
-          description: True for at most one model, and only while active (INV-3).
+          description: True for at most one model, and only while active AND free (INV-3).
         hasApiKey:
           type: boolean
           description: Whether a provider API key is stored. The key itself is never exposed.
@@ -795,6 +809,10 @@ components:
         isActive:
           type: boolean
           default: true
+        isFree:
+          type: boolean
+          default: true
+          description: Whether FREE-plan users may use this model.
 
     UpdateModelRequest:
       type: object
@@ -823,6 +841,12 @@ components:
           writeOnly: true
         isActive:
           type: boolean
+        isFree:
+          type: boolean
+          description: |
+            Toggle FREE-plan access. Removing free access from the current
+            default model is refused (400) — the default must stay usable by
+            FREE users.
 
     # ---- Streaming event payloads ----
     ModelSummary:

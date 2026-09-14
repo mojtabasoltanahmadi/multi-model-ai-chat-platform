@@ -184,7 +184,67 @@ async function main() {
   check('deactivating a non-default model works (200)', deactivateA.status === 200);
 
   const publicModels = (await api('GET', '/models', { token: userToken })).json;
-  check('user model list contains only active models', publicModels.every((m) => m.isActive) && publicModels.some((m) => m.id === modelB.id));
+  check('user model list contains only active AND free models', publicModels.every((m) => m.isActive && m.isFree) && publicModels.some((m) => m.id === modelB.id));
+
+  // ---------- Free-plan model access (backend is the authorization source) ----------
+  // modelA is active but premium (isFree=false): hidden from the picker…
+  const premiumModel = (
+    await api('POST', '/admin/models', {
+      token: adminToken,
+      body: { name: 'Mock Premium', provider: 'mock', externalModelId: 'mock-premium', isFree: false },
+    })
+  ).json;
+  const premiumModels = (await api('GET', '/models', { token: userToken })).json;
+  check('premium (non-free) model hidden from user model list', !premiumModels.some((m) => m.id === premiumModel.id));
+
+  // …and even when the frontend is bypassed, direct API calls are rejected.
+  const premiumConv = await api('POST', '/conversations', { token: userToken, body: {} });
+  const premiumModelMessage = await streamMessage(userToken, premiumConv.json.id, {
+    content: 'hello',
+    modelId: premiumModel.id,
+  });
+  check('free user cannot chat with a premium model (403)', premiumModelMessage.status === 403);
+
+  // Admin can grant and revoke free access via PATCH.
+  const grantFree = await api('PATCH', `/admin/models/${premiumModel.id}`, {
+    token: adminToken,
+    body: { isFree: true },
+  });
+  check('admin can grant free access (200)', grantFree.status === 200 && grantFree.json?.isFree === true);
+  const grantedList = (await api('GET', '/models', { token: userToken })).json;
+  check('granted model appears in user model list', grantedList.some((m) => m.id === premiumModel.id));
+
+  const revokeFree = await api('PATCH', `/admin/models/${premiumModel.id}`, {
+    token: adminToken,
+    body: { isFree: false },
+  });
+  check('admin can revoke free access (200)', revokeFree.status === 200 && revokeFree.json?.isFree === false);
+  const revokedList = (await api('GET', '/models', { token: userToken })).json;
+  check('revoked model disappears from user model list', !revokedList.some((m) => m.id === premiumModel.id));
+  const revokedModelMessage = await streamMessage(userToken, premiumConv.json.id, {
+    content: 'hello again',
+    modelId: premiumModel.id,
+  });
+  check('free user cannot chat with a revoked model (403)', revokedModelMessage.status === 403);
+
+  // Free users can still chat with an authorized model.
+  const freeStream = await streamMessage(userToken, premiumConv.json.id, {
+    content: 'hello',
+    modelId: modelB.id,
+  });
+  check('free user can chat with an active free model (200 SSE)', freeStream.status === 200 && freeStream.finalEvent === 'done');
+
+  // The default model must never lose free access (default = active + free).
+  const unFreeDefault = await api('PATCH', `/admin/models/${modelB.id}`, {
+    token: adminToken,
+    body: { isFree: false },
+  });
+  check('removing free access from the default model rejected (400)', unFreeDefault.status === 400);
+
+  const nonFreeAsDefault = await api('POST', `/admin/models/${premiumModel.id}/default`, { token: adminToken });
+  check('setting a non-free model as default rejected (400)', nonFreeAsDefault.status === 400);
+
+  await api('DELETE', `/admin/models/${premiumModel.id}`, { token: adminToken });
 
   // ---------- Conversations ----------
   const conv = await api('POST', '/conversations', { token: userToken, body: {} });
