@@ -35,4 +35,8 @@ export class CreateModelDto {
   @IsOptional()
   @IsBoolean({ message: 'وضعیت فعال باید true یا false باشد.' })
   isActive?: boolean;
+
+  @IsOptional()
+  @IsBoolean({ message: 'وضعیت رایگان باید true یا false باشد.' })
+  isFree?: boolean;
 }
