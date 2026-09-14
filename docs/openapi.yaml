@@ -425,7 +425,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/AiModel'
         '400':
-          description: Validation failure or protected default model. Codes: `VALIDATION_ERROR`, `DEFAULT_MODEL_PROTECTED`.
+          description: 'Validation failure or protected default model. Codes: `VALIDATION_ERROR`, `DEFAULT_MODEL_PROTECTED`.'
           content:
             application/json:
               schema:
@@ -536,7 +536,7 @@ components:
 
   responses:
     BadRequest:
-      description: Invalid input (shape, format, blank content, bad UUID, etc.). Code: `VALIDATION_ERROR`.
+      description: 'Invalid input (shape, format, blank content, bad UUID, etc.). Code: `VALIDATION_ERROR`.'
       content:
         application/json:
           schema:
@@ -546,7 +546,7 @@ components:
               code: VALIDATION_ERROR
               message: 'متن پیام نمی‌تواند خالی یا فقط فاصله باشد.'
     Unauthorized:
-      description: Missing, malformed, or expired token. Code: `UNAUTHENTICATED`.
+      description: 'Missing, malformed, or expired token. Code: `UNAUTHENTICATED`.'
       content:
         application/json:
           schema:
@@ -556,7 +556,7 @@ components:
               code: UNAUTHENTICATED
               message: 'توکن نامعتبر یا منقضی شده است.'
     Forbidden:
-      description: Authenticated but not an admin. Code: `FORBIDDEN`.
+      description: 'Authenticated but not an admin. Code: `FORBIDDEN`.'
       content:
         application/json:
           schema:
@@ -566,7 +566,7 @@ components:
               code: FORBIDDEN
               message: 'شما اجازه دسترسی به این بخش را ندارید.'
     NotFound:
-      description: Unknown resource, or a resource owned by another user (indistinguishable). Code: `RESOURCE_NOT_FOUND`.
+      description: 'Unknown resource, or a resource owned by another user (indistinguishable). Code: `RESOURCE_NOT_FOUND`.'
       content:
         application/json:
           schema:
@@ -576,7 +576,7 @@ components:
               code: RESOURCE_NOT_FOUND
               message: 'گفتگو پیدا نشد.'
     InternalError:
-      description: Unexpected server error; details are logged server-side only. Code: `INTERNAL_ERROR`.
+      description: 'Unexpected server error; details are logged server-side only. Code: `INTERNAL_ERROR`.'
       content:
         application/json:
           schema:
@@ -622,7 +622,7 @@ components:
       properties:
         accessToken:
           type: string
-          description: JWT; send as `Authorization: Bearer <token>`.
+          description: 'JWT; send as `Authorization: Bearer <token>`.'
         user:
           $ref: '#/components/schemas/User'
 
