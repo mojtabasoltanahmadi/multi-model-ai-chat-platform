@@ -30,4 +30,15 @@ export class SendMessageDto {
   @IsOptional()
   @IsUUID('4', { message: 'شناسه مدل نامعتبر است.' })
   modelId?: string;
+
+  /**
+   * Client-generated idempotency token (≤ 64 chars). Two requests with the
+   * same `clientMessageId` for the same conversation reuse the original user
+   * row instead of creating a duplicate (refreshing mid-send, double-click,
+   * automatic retries).
+   */
+  @IsOptional()
+  @IsString({ message: 'شناسه تکرارناپذیری پیام باید متن باشد.' })
+  @MaxLength(64, { message: 'شناسه تکرارناپذیری پیام حداکثر ۶۴ کاراکتر است.' })
+  clientMessageId?: string;
 }
