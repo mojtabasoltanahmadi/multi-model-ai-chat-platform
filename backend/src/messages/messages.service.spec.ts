@@ -192,6 +192,56 @@ describe('MessagesService.streamChatTurn', () => {
     expect(cb.onError).not.toHaveBeenCalled();
   });
 
+  it('marks the row interrupted when the client bails out BEFORE any delta arrives', async () => {
+    // Real-world scenario: user hits Send, then immediately closes the tab.
+    // The provider may not have produced any bytes yet, so the for-await
+    // body never executes — we still need to persist something better than
+    // a 'pending' row that never gets a 'completed' update.
+    setup();
+    let disconnected = true;
+    aiProviderService.streamChat.mockImplementation(async function* () {
+      // First yield happens after we've already declared the client gone.
+      yield 'late answer nobody saw';
+    });
+    const cb = callbacks();
+
+    await service.streamChatTurn('user-1', 'conv-1', 'سلام', undefined, undefined, () => disconnected, cb);
+
+    const savedAssistantFinal = messagesRepository.saved
+      .filter((row: any) => row.role === 'assistant')
+      .at(-1);
+    expect(savedAssistantFinal.status).toBe('interrupted');
+    // The post-loop disconnect check fires even though the body never ran.
+    // No deltas were actually delivered to the client, so the content may
+    // be empty.
+    expect(cb.onDelta).not.toHaveBeenCalled();
+    expect(cb.onDone).not.toHaveBeenCalled();
+    expect(cb.onError).not.toHaveBeenCalled();
+  });
+
+  it('marks the row interrupted (not failed) when the stream throws AbortError AFTER the client disconnected', async () => {
+    // Real-world: the client has already gone away, and the provider's read
+    // subsequently throws AbortError. Without the disambiguation, this would
+    // be classified as 'failed' — same status as a provider outage, which
+    // is wrong: the client simply missed the rest.
+    setup();
+    aiProviderService.streamChat.mockImplementation(async function* () {
+      yield 'قسمت اول';
+      // Simulate the read throwing because the underlying fetch was aborted.
+      throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+    });
+    const cb = callbacks();
+
+    await service.streamChatTurn('user-1', 'conv-1', 'سلام', undefined, undefined, () => true, cb);
+
+    const savedAssistantFinal = messagesRepository.saved
+      .filter((row: any) => row.role === 'assistant')
+      .at(-1);
+    expect(savedAssistantFinal.status).toBe('interrupted');
+    expect(cb.onError).not.toHaveBeenCalled();
+    expect(cb.onDone).not.toHaveBeenCalled();
+  });
+
   it('flips the assistant row to status=streaming on the first delta', async () => {
     setup();
     aiProviderService.streamChat.mockImplementation(async function* () {

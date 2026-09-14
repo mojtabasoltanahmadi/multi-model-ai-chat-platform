@@ -240,10 +240,32 @@ export class MessagesService {
         callbacks.onDelta(delta);
       }
 
+      // If the client bails out before the first delta arrives, the loop
+      // body never executes and we'd otherwise persist status='completed'
+      // for a partial response the user never saw. Check again at the end
+      // so a disconnect-at-zero-bytes still surfaces as 'interrupted'.
+      if (isClientDisconnected()) {
+        assistantMessage.status = 'interrupted';
+        assistantMessage.errorMessage = 'Client disconnected before completion.';
+        await this.messagesRepository.save(assistantMessage);
+        return;
+      }
+
       assistantMessage.status = 'completed';
       const saved = await this.messagesRepository.save(assistantMessage);
       callbacks.onDone(saved);
     } catch (error) {
+      // Two distinct abort paths share the AbortError class — disambiguate
+      // by checking whether the client is still connected:
+      //   - client gone → status='interrupted' (no error event, the
+      //     disconnector couldn't receive it anyway)
+      //   - server-side timeout → status='failed' with a generic message
+      if (isClientDisconnected()) {
+        assistantMessage.status = 'interrupted';
+        assistantMessage.errorMessage = 'Client disconnected before completion.';
+        await this.messagesRepository.save(assistantMessage);
+        return;
+      }
       const isAbort = error instanceof Error && error.name === 'AbortError';
       this.logger.error(
         `AI stream failed for conversation ${conversation.id}: ${
