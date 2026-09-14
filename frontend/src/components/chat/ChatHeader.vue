@@ -81,6 +81,9 @@ const emit = defineEmits<{ 'update:modelId': [id: string]; openMenu: [] }>();
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  /* Flex items don't shrink below content width without this; without it a
+     long title overflows the header row on narrow screens. */
+  min-width: 0;
 }
 
 .chat-header__spacer {
@@ -90,6 +93,8 @@ const emit = defineEmits<{ 'update:modelId': [id: string]; openMenu: [] }>();
 @media (max-width: 1023px) {
   .chat-header__menu-button {
     display: grid;
+    width: 2.5rem;
+    height: 2.5rem;
   }
 
   .chat-header__brand {
