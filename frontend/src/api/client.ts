@@ -82,8 +82,24 @@ export async function api<T>(
 
 // ---- SSE streaming (fetch + ReadableStream; EventSource cannot POST with JWT) ----
 
+export interface StreamMetaPayload {
+  /** The persisted user row (existing or freshly created). */
+  userMessage: Message;
+  /**
+   * The assistant row, pre-persisted with status='pending' BEFORE the first
+   * delta. Its id is real and stable — a reload mid-stream can address it.
+   */
+  assistantMessage: Message;
+  model: AiModel;
+  /**
+   * true when this is a retry of a previous send (same clientMessageId).
+   * The user row was reused; a fresh assistant row is being streamed.
+   */
+  replay: boolean;
+}
+
 export interface StreamEvents {
-  onMeta: (payload: { userMessage: Message; model: AiModel }) => void;
+  onMeta: (payload: StreamMetaPayload) => void;
   onDelta: (payload: { text: string }) => void;
   onDone: (payload: { assistantMessage: Message }) => void;
   onError: (message: string) => void;
@@ -101,9 +117,18 @@ export function streamChatMessage(
   void (async () => {
     let response: Response;
     try {
+      // The backend reads clientMessageId from the body, OR from an
+      // Idempotency-Key header (defense-in-depth: proxies / replay logs).
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        ...authHeader(),
+      };
+      if (payload.clientMessageId && !headers['Idempotency-Key']) {
+        headers['Idempotency-Key'] = payload.clientMessageId;
+      }
       response = await fetch(`${BASE}/conversations/${conversationId}/messages`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeader() },
+        headers,
         body: JSON.stringify(payload),
         signal: controller.signal,
       });
@@ -138,11 +163,11 @@ export function streamChatMessage(
       }
       if (!data) return;
       try {
-        const parsed = JSON.parse(data) as Record<string, unknown>;
-        if (event === 'meta') events.onMeta(parsed as Parameters<StreamEvents['onMeta']>[0]);
+        const parsed: unknown = JSON.parse(data);
+        if (event === 'meta') events.onMeta(parsed as StreamMetaPayload);
         else if (event === 'delta') events.onDelta(parsed as { text: string });
-        else if (event === 'done') events.onDone(parsed as Parameters<StreamEvents['onDone']>[0]);
-        else if (event === 'error') events.onError(String(parsed.message ?? 'خطا'));
+        else if (event === 'done') events.onDone(parsed as { assistantMessage: Message });
+        else if (event === 'error') events.onError(String((parsed as { message?: unknown })?.message ?? 'خطا'));
       } catch {
         /* ignore malformed keep-alive lines */
       }
