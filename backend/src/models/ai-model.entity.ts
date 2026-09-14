@@ -38,6 +38,14 @@ export class AiModel {
   @Column({ name: 'is_active', type: 'boolean', default: true })
   isActive: boolean;
 
+  /**
+   * Whether the model is available to users on the FREE plan (the only plan
+   * in the MVP). Independent of isActive: a model can be free-configured but
+   * temporarily disabled. The default model must be active AND free.
+   */
+  @Column({ name: 'is_free', type: 'boolean', default: true })
+  isFree: boolean;
+
   @Column({ name: 'is_default', type: 'boolean', default: false })
   isDefault: boolean;
 
