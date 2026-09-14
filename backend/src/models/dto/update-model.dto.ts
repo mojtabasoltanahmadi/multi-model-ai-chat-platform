@@ -36,4 +36,8 @@ export class UpdateModelDto {
   @IsOptional()
   @IsBoolean()
   isActive?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  isFree?: boolean;
 }
