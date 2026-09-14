@@ -1,0 +1,904 @@
+openapi: 3.0.3
+info:
+  title: Hooshyar AI Chat Platform API
+  version: 1.0.0
+  description: |
+    API contract for the multi-model AI chat platform MVP (Persian-first, RTL).
+
+    **Base conventions**
+
+    * All timestamps are ISO-8601 UTC strings (`format: date-time`).
+    * All ids are UUID v4 strings.
+    * All endpoints require a Bearer JWT **except** `register` and `login`.
+    * JWTs expire after 24 hours. When expired or invalid, every protected
+      endpoint returns `401 UNAUTHENTICATED`.
+
+    **Error contract**
+
+    Every non-2xx JSON response uses one envelope:
+
+    ```json
+    { "error": { "code": "RESOURCE_NOT_FOUND", "message": "گفتگو پیدا نشد." } }
+    ```
+
+    `code` is machine-readable (stable, for frontend branching); `message` is a
+    Persian, user-displayable string. Provider internals (names, hosts, HTTP
+    codes, timeouts) never appear in any response.
+
+    **Streaming (POST /conversations/{id}/messages)**
+
+    Success responds `200` with `text/event-stream` (SSE over POST because
+    EventSource cannot send an Authorization header or a body). Pre-stream
+    validation failures (auth, ownership, model resolution, message validation)
+    return the standard JSON error responses below — **not** SSE events. Once
+    the stream opens, exactly one terminal event (`done` or `error`) is emitted:
+
+    ```
+    event: meta   data: {"userMessage": {...}, "model": {...}}   # once, first
+    event: delta  data: {"text": "chunk"}                        # 0..n times
+    event: done   data: {"assistantMessage": {...}}              # terminal (success)
+    event: error  data: {"message": "سرویس ... موقتاً در دسترس نیست."} # terminal (failure)
+    ```
+
+    On the `error` event the backend has already persisted exactly one
+    assistant message with `status = "error"` containing any partial content.
+
+    **Business rules not expressible as schema constraints**
+
+    * BR-4: message content must be non-blank after trim and at most 4000 chars.
+    * BR-5/INV-3: at most one default model exists and it is active; the
+      default swap is atomic.
+    * BR-6/INV-4: the default model cannot be deactivated or deleted until
+      another model is default; inactive models are never usable for a chat turn.
+    * BR-7: the first active model created becomes the default automatically.
+    * BR-8/INV-5: one logical assistant message per turn, in every outcome.
+    * A-7: the conversation title is auto-set from the first message
+      (truncated to 200 chars) if the title is still the default.
+
+    **Collections** are plain JSON arrays — no pagination, filtering, or
+    sorting parameters in the MVP (by design decision A-9).
+
+servers:
+  - url: http://localhost:4000/api
+    description: Backend (development)
+  - url: http://localhost:5200/api
+    description: Through the Vite dev proxy (frontend development)
+
+tags:
+  - name: Auth
+    description: Registration and login. Public endpoints.
+  - name: Conversations
+    description: Conversation list, creation, and history retrieval.
+  - name: Chat
+    description: Sending messages and receiving streamed AI answers.
+  - name: Models
+    description: Active model discovery for the chat UI.
+  - name: Admin Models
+    description: Model lifecycle management. Requires the `admin` role.
+
+security:
+  - bearerAuth: []
+
+paths:
+  /auth/register:
+    post:
+      tags: [Auth]
+      operationId: register
+      summary: Register a new user account
+      description: |
+        Creates a user account with role `user`. Emails are normalized
+        (trimmed, lower-cased) before the uniqueness check. Passwords are
+        stored as bcrypt hashes only (INV-2) and never returned.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+            examples:
+              valid:
+                value: { email: 'sara@example.com', password: 'password123' }
+      responses:
+        '201':
+          description: Account created; the user is immediately authenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Email already registered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: EMAIL_ALREADY_EXISTS
+                  message: 'این ایمیل قبلاً ثبت شده است.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Log in with email and password
+      description: |
+        Returns a JWT and the user profile. Unknown email and wrong password
+        return the **same** error (BR-9) so accounts cannot be enumerated.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Authenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Invalid credentials (identical for unknown email and wrong password).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: UNAUTHENTICATED
+                  message: 'ایمیل یا رمز عبور اشتباه است.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /conversations:
+    get:
+      tags: [Conversations]
+      operationId: listConversations
+      summary: List the caller's conversations
+      description: Returns only conversations owned by the authenticated user (INV-1), newest first. Unpaginated by design.
+      responses:
+        '200':
+          description: Conversation collection (may be empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Conversation'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [Conversations]
+      operationId: createConversation
+      summary: Create a conversation
+      description: Creates a conversation owned by the caller. Omit the body (or send `{}`) to use the default title.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateConversationRequest'
+      responses:
+        '201':
+          description: Conversation created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /conversations/{conversationId}:
+    get:
+      tags: [Conversations]
+      operationId: getConversation
+      summary: Get a conversation with its messages
+      description: |
+        Returns the conversation and its full message history (oldest first).
+        A conversation owned by another user responds exactly like a
+        nonexistent one (404) — no existence leak (INV-1, INV-9).
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+      responses:
+        '200':
+          description: Conversation with messages.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConversationDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /conversations/{conversationId}/messages:
+    post:
+      tags: [Chat]
+      operationId: sendMessage
+      summary: Send a message and stream the AI answer (SSE)
+      description: |
+        Persists the user message, resolves the model (explicit `modelId`
+        when provided and active, otherwise the default model), calls the AI
+        provider, and streams the answer back as Server-Sent Events.
+
+        **Order of checks (all pre-stream, returning normal JSON errors):**
+        1. auth → `401`
+        2. UUID shape → `400 VALIDATION_ERROR`
+        3. message validation → `400 VALIDATION_ERROR`
+        4. conversation exists **and** belongs to caller → `404 RESOURCE_NOT_FOUND`
+        5. model resolution: unknown id → `404`; inactive id → `400 MODEL_INACTIVE`;
+           no default configured → `400 NO_DEFAULT_MODEL`
+
+        Then the stream opens (see the Streaming section in the API info):
+        `meta` → `delta`* → `done` | `error`. Exactly one assistant message is
+        persisted per turn in every outcome (INV-5). The provider request is
+        aborted after the configured timeout (A-8, default 60s) and surfaces as
+        the generic `error` terminal event.
+
+        The first message of an untitled conversation auto-sets its title (A-7).
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendMessageRequest'
+            examples:
+              defaultModel:
+                value: { content: 'سلام، یک ایده برای پروژه بده.' }
+              explicitModel:
+                value:
+                  content: 'Explain this code.'
+                  modelId: '9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d'
+      responses:
+        '200':
+          description: |
+            SSE stream (`text/event-stream`). Event payloads use the
+            `StreamMetaEvent`, `StreamDeltaEvent`, `StreamDoneEvent`, and
+            `StreamErrorEvent` schemas documented in components. If the client
+            disconnects mid-stream, the server persists the partial answer
+            with `status = "error"` and closes silently.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                event: meta
+                data: {"userMessage":{"id":"e083f38c-155a-4ada-a85a-e04191d71831","conversationId":"3f7a9529-fcc2-4d6d-9723-ac6d69f928af","role":"user","content":"سلام","status":null,"errorMessage":null,"modelId":null,"createdAt":"2026-09-14T13:38:01.304Z"},"model":{"id":"84bc6ca9-b6c2-485f-828f-a48c32524759","name":"Mock GPT","provider":"mock"}}
+
+                event: delta
+                data: {"text":"سلام! "}
+
+                event: delta
+                data: {"text":"این یک پاسخ آزمایشی است."}
+
+                event: done
+                data: {"assistantMessage":{"id":"17d53156-1e46-4c61-b444-3ba9506b2d0b","conversationId":"3f7a9529-fcc2-4d6d-9723-ac6d69f928af","role":"assistant","content":"سلام! این یک پاسخ آزمایشی است.","status":"completed","errorMessage":null,"modelId":"84bc6ca9-b6c2-485f-828f-a48c32524759","createdAt":"2026-09-14T13:38:03.352Z"}}
+        '400':
+          description: 'Validation failure, inactive model, or no default model. Codes: `VALIDATION_ERROR`, `MODEL_INACTIVE`, `NO_DEFAULT_MODEL`.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Unknown/foreign conversation or unknown model id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /models:
+    get:
+      tags: [Models]
+      operationId: listActiveModels
+      summary: List active models for the chat picker
+      description: |
+        Returns models with `isActive = true` only — inactive models are
+        never usable for a new chat turn (INV-4). Provider API keys are
+        never included in any model response.
+      responses:
+        '200':
+          description: Active model collection (may be empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AiModel'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/models:
+    get:
+      tags: [Admin Models]
+      operationId: adminListModels
+      summary: List all models (admin)
+      description: All models regardless of state, oldest first. Requires role `admin` (INV-8).
+      responses:
+        '200':
+          description: Model collection (may be empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AiModel'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [Admin Models]
+      operationId: adminCreateModel
+      summary: Create a model (admin)
+      description: |
+        Creates a model. The first active model created becomes the default
+        automatically (BR-7); later models never steal the default flag.
+        The provider API key (if given) is stored server-side and is never
+        returned by any endpoint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateModelRequest'
+            examples:
+              mock:
+                summary: Demo model, no key required
+                value:
+                  name: 'Mock GPT'
+                  provider: 'mock'
+                  externalModelId: 'mock-1'
+              openai:
+                summary: Real OpenAI-compatible model
+                value:
+                  name: 'GPT-4o mini'
+                  provider: 'openai-compatible'
+                  externalModelId: 'gpt-4o-mini'
+                  baseUrl: 'https://api.openai.com/v1'
+                  apiKey: 'sk-...'
+      responses:
+        '201':
+          description: Model created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AiModel'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/models/{modelId}:
+    patch:
+      tags: [Admin Models]
+      operationId: adminUpdateModel
+      summary: Update a model (admin)
+      description: |
+        Partial update; unknown fields are rejected. Sending `isActive:
+        false` for the current default model is refused (BR-6) until another
+        model is made default first. At least one field must be provided.
+      parameters:
+        - $ref: '#/components/parameters/ModelId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateModelRequest'
+      responses:
+        '200':
+          description: Updated model.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AiModel'
+        '400':
+          description: Validation failure or protected default model. Codes: `VALIDATION_ERROR`, `DEFAULT_MODEL_PROTECTED`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: DEFAULT_MODEL_PROTECTED
+                  message: 'مدل پیش‌فرض را نمی‌توان غیرفعال کرد. ابتدا یک مدل دیگر را پیش‌فرض کنید.'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [Admin Models]
+      operationId: adminDeleteModel
+      summary: Delete a model (admin)
+      description: |
+        Deletes a non-default model. Deleting the default model is refused
+        (BR-6). Historical messages referencing a deleted model keep their
+        content; their `modelId` becomes `null` (FK ON DELETE SET NULL).
+      parameters:
+        - $ref: '#/components/parameters/ModelId'
+      responses:
+        '204':
+          description: Deleted. No response body.
+        '400':
+          description: 'Protected default model. Code: `DEFAULT_MODEL_PROTECTED`.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/models/{modelId}/default:
+    post:
+      tags: [Admin Models]
+      operationId: adminSetDefaultModel
+      summary: Set the default model (admin)
+      description: |
+        Atomically makes this model the single default (clear-all + set-one,
+        BR-5). The target must exist and be active. After this call exactly
+        one default model exists (INV-3). Runtime configuration only — no
+        redeploy required.
+      parameters:
+        - $ref: '#/components/parameters/ModelId'
+      responses:
+        '200':
+          description: The model is now the default.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AiModel'
+        '400':
+          description: 'Model is inactive. Code: `MODEL_INACTIVE`.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: MODEL_INACTIVE
+                  message: 'فقط مدل فعال می‌تواند پیش‌فرض شود.'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 'Authorization: Bearer <accessToken> from register/login. Expires in 24h.'
+
+  parameters:
+    ConversationId:
+      name: conversationId
+      in: path
+      required: true
+      description: Conversation UUID.
+      schema:
+        type: string
+        format: uuid
+    ModelId:
+      name: modelId
+      in: path
+      required: true
+      description: Model UUID.
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadRequest:
+      description: Invalid input (shape, format, blank content, bad UUID, etc.). Code: `VALIDATION_ERROR`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: 'متن پیام نمی‌تواند خالی یا فقط فاصله باشد.'
+    Unauthorized:
+      description: Missing, malformed, or expired token. Code: `UNAUTHENTICATED`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: UNAUTHENTICATED
+              message: 'توکن نامعتبر یا منقضی شده است.'
+    Forbidden:
+      description: Authenticated but not an admin. Code: `FORBIDDEN`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: FORBIDDEN
+              message: 'شما اجازه دسترسی به این بخش را ندارید.'
+    NotFound:
+      description: Unknown resource, or a resource owned by another user (indistinguishable). Code: `RESOURCE_NOT_FOUND`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: RESOURCE_NOT_FOUND
+              message: 'گفتگو پیدا نشد.'
+    InternalError:
+      description: Unexpected server error; details are logged server-side only. Code: `INTERNAL_ERROR`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: INTERNAL_ERROR
+              message: 'خطای غیرمنتظره‌ای رخ داد. لطفاً دوباره تلاش کنید.'
+
+  schemas:
+    # ---- Auth ----
+    RegisterRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 255
+          description: Normalized (trimmed, lower-cased) before uniqueness check.
+        password:
+          type: string
+          minLength: 8
+          maxLength: 72
+          writeOnly: true
+          description: Minimum 8 characters (BR-2); max 72 (bcrypt input limit).
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 1
+          maxLength: 72
+
+    AuthResponse:
+      type: object
+      required: [accessToken, user]
+      properties:
+        accessToken:
+          type: string
+          description: JWT; send as `Authorization: Bearer <token>`.
+        user:
+          $ref: '#/components/schemas/User'
+
+    User:
+      type: object
+      required: [id, email, role]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        role:
+          type: string
+          enum: [user, admin]
+
+    # ---- Conversations & messages ----
+    CreateConversationRequest:
+      type: object
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Optional; defaults to «گفتگوی جدید». Auto-set from the first message when left default (A-7).
+
+    Conversation:
+      type: object
+      required: [id, title, userId, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+          maxLength: 200
+        userId:
+          type: string
+          format: uuid
+          description: Owning user (INV — exactly one owner per conversation).
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+          description: Bumped on new messages; used for newest-first ordering.
+
+    ConversationDetail:
+      type: object
+      required: [conversation, messages]
+      properties:
+        conversation:
+          $ref: '#/components/schemas/Conversation'
+        messages:
+          type: array
+          description: Full history, oldest first. Unpaginated by design (A-9).
+          items:
+            $ref: '#/components/schemas/Message'
+
+    Message:
+      type: object
+      required: [id, conversationId, role, content, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        conversationId:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum: [user, assistant]
+        content:
+          type: string
+          description: For assistant messages with `status = "error"` this is the partial answer (possibly empty).
+        status:
+          type: string
+          enum: [completed, error]
+          nullable: true
+          description: '`null` for user messages; distinguishes success from failure of an assistant turn (BR-8).'
+        errorMessage:
+          type: string
+          nullable: true
+          description: Safe, client-displayable failure note for error-status assistant messages.
+        modelId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Model that produced an assistant message; `null` for user messages and for messages whose model was later deleted.
+        createdAt:
+          type: string
+          format: date-time
+
+    SendMessageRequest:
+      type: object
+      required: [content]
+      properties:
+        content:
+          type: string
+          minLength: 1
+          maxLength: 4000
+          pattern: \S
+          description: Non-blank after trim (BR-4); `pattern` requires at least one non-whitespace character.
+        modelId:
+          type: string
+          format: uuid
+          description: Optional; must reference an **active** model. Omit to use the default model.
+
+    # ---- Models ----
+    AiModel:
+      type: object
+      required: [id, name, provider, externalModelId, baseUrl, isActive, isDefault, hasApiKey, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          maxLength: 100
+        provider:
+          type: string
+          enum: [mock, openai-compatible]
+        externalModelId:
+          type: string
+          maxLength: 200
+          description: Model identifier at the provider (ignored by `mock`).
+        baseUrl:
+          type: string
+          nullable: true
+          maxLength: 500
+          description: OpenAI-compatible base URL; `null` uses the provider default.
+        isActive:
+          type: boolean
+        isDefault:
+          type: boolean
+          description: True for at most one model, and only while active (INV-3).
+        hasApiKey:
+          type: boolean
+          description: Whether a provider API key is stored. The key itself is never exposed.
+        createdAt:
+          type: string
+          format: date-time
+
+    CreateModelRequest:
+      type: object
+      required: [name, provider, externalModelId]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        provider:
+          type: string
+          enum: [mock, openai-compatible]
+        externalModelId:
+          type: string
+          minLength: 1
+          maxLength: 200
+        baseUrl:
+          type: string
+          maxLength: 500
+          description: Optional; only meaningful for `openai-compatible`.
+        apiKey:
+          type: string
+          maxLength: 500
+          writeOnly: true
+          description: Optional for `mock`; required in practice for `openai-compatible` (enforced at call time, not creation).
+        isActive:
+          type: boolean
+          default: true
+
+    UpdateModelRequest:
+      type: object
+      minProperties: 1
+      description: Partial update; at least one field required. Unknown fields are rejected.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        provider:
+          type: string
+          enum: [mock, openai-compatible]
+        externalModelId:
+          type: string
+          minLength: 1
+          maxLength: 200
+        baseUrl:
+          type: string
+          nullable: true
+          maxLength: 500
+          description: Send `null` to clear.
+        apiKey:
+          type: string
+          maxLength: 500
+          writeOnly: true
+        isActive:
+          type: boolean
+
+    # ---- Streaming event payloads ----
+    ModelSummary:
+      type: object
+      required: [id, name, provider]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        provider:
+          type: string
+          enum: [mock, openai-compatible]
+
+    StreamMetaEvent:
+      type: object
+      required: [userMessage, model]
+      description: First event; emitted once after the user message is persisted.
+      properties:
+        userMessage:
+          $ref: '#/components/schemas/Message'
+        model:
+          $ref: '#/components/schemas/ModelSummary'
+
+    StreamDeltaEvent:
+      type: object
+      required: [text]
+      description: One answer chunk; zero or more times. Concatenating all `text` values yields the full answer.
+      properties:
+        text:
+          type: string
+
+    StreamDoneEvent:
+      type: object
+      required: [assistantMessage]
+      description: Terminal success event; the persisted assistant message (`status = "completed"`).
+      properties:
+        assistantMessage:
+          $ref: '#/components/schemas/Message'
+
+    StreamErrorEvent:
+      type: object
+      required: [message]
+      description: Terminal failure event; a partial assistant message with `status = "error"` has been persisted. Message is generic Persian text; never contains provider details.
+      properties:
+        message:
+          type: string
+          example: 'سرویس هوش مصنوعی موقتاً در دسترس نیست. لطفاً دوباره تلاش کنید.'
+
+    # ---- Error contract ----
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - VALIDATION_ERROR
+                - EMAIL_ALREADY_EXISTS
+                - MODEL_INACTIVE
+                - NO_DEFAULT_MODEL
+                - DEFAULT_MODEL_PROTECTED
+                - UNAUTHENTICATED
+                - FORBIDDEN
+                - RESOURCE_NOT_FOUND
+                - INTERNAL_ERROR
+              description: |
+                Stable machine-readable code. Status-code mapping:
+                400 → VALIDATION_ERROR | MODEL_INACTIVE | NO_DEFAULT_MODEL | DEFAULT_MODEL_PROTECTED;
+                401 → UNAUTHENTICATED; 403 → FORBIDDEN; 404 → RESOURCE_NOT_FOUND;
+                409 → EMAIL_ALREADY_EXISTS; 500 → INTERNAL_ERROR.
+            message:
+              type: string
+              description: Persian, user-displayable message (safe; no technical detail).
