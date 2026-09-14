@@ -11,6 +11,7 @@ interface ModelFormState {
   externalModelId: string;
   baseUrl: string;
   apiKey: string;
+  isFree: boolean;
 }
 
 const emit = defineEmits<{ submit: [values: CreateModelPayload]; close: [] }>();
@@ -21,6 +22,7 @@ const values = reactive<ModelFormState>({
   externalModelId: '',
   baseUrl: '',
   apiKey: '',
+  isFree: true,
 });
 
 const submitting = ref(false);
@@ -44,6 +46,7 @@ async function submit() {
       externalModelId: values.externalModelId.trim(),
       baseUrl: values.baseUrl.trim() || undefined,
       apiKey: values.apiKey.trim() || undefined,
+      isFree: values.isFree,
     });
   } finally {
     submitting.value = false;
@@ -113,9 +116,32 @@ async function submit() {
         placeholder="sk-…"
       />
 
+      <div class="model-form__field">
+        <span class="model-form__label">دسترسی طرح رایگان</span>
+        <button
+          type="button"
+          class="model-form__free-toggle"
+          role="switch"
+          :aria-checked="values.isFree"
+          @click="values.isFree = !values.isFree"
+        >
+          <span class="model-form__free-text">
+            <strong>{{ values.isFree ? 'رایگان' : 'پریمیوم' }}</strong>
+            <span>
+              {{
+                values.isFree
+                  ? 'کاربران طرح رایگان می‌توانند این مدل را انتخاب کنند'
+                  : 'این مدل برای کاربران طرح رایگان در دسترس نخواهد بود'
+              }}
+            </span>
+          </span>
+          <span class="model-form__free-knob" aria-hidden="true"></span>
+        </button>
+      </div>
+
       <p class="model-form__note">
-        کلید API فقط در سرور ذخیره می‌شود و هرگز نمایش داده نمی‌شود. اولین مدل فعال، به‌طور
-        خودکار پیش‌فرض می‌شود.
+        کلید API فقط در سرور ذخیره می‌شود و هرگز نمایش داده نمی‌شود. اولین مدل فعال و رایگان،
+        به‌طور خودکار پیش‌فرض می‌شود.
       </p>
     </form>
 
@@ -187,6 +213,81 @@ async function submit() {
   background: var(--surface-inset);
   border-radius: var(--radius-sm);
   padding: 0.55rem 0.75rem;
+}
+
+/* free-plan toggle (switch) */
+.model-form__free-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+  width: 100%;
+  padding: 0.65rem 0.8rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  text-align: right;
+  cursor: pointer;
+  transition: border-color var(--motion-fast) var(--ease-out);
+}
+
+.model-form__free-toggle:hover {
+  border-color: var(--border-strong);
+}
+
+.model-form__free-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.model-form__free-text {
+  display: grid;
+  gap: 0.1rem;
+}
+
+.model-form__free-text strong {
+  font-size: 0.84rem;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.model-form__free-text span {
+  font-size: 0.7rem;
+  color: var(--text-3);
+}
+
+.model-form__free-knob {
+  position: relative;
+  flex-shrink: 0;
+  width: 2.4rem;
+  height: 1.35rem;
+  border-radius: var(--radius-full);
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  transition: background var(--motion-fast) var(--ease-out);
+}
+
+.model-form__free-knob::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  inset-inline-start: 0.15rem;
+  translate: 0 -50%;
+  width: 1rem;
+  height: 1rem;
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  box-shadow: var(--shadow-1);
+  transition: inset-inline-start var(--motion-fast) var(--ease-out);
+}
+
+.model-form__free-toggle[aria-checked='true'] .model-form__free-knob {
+  background: var(--info);
+  border-color: var(--info);
+}
+
+.model-form__free-toggle[aria-checked='true'] .model-form__free-knob::after {
+  inset-inline-start: calc(100% - 1.15rem);
 }
 
 @media (max-width: 640px) {

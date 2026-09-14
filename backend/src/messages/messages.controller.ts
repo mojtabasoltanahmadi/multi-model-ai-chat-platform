@@ -103,6 +103,7 @@ export class MessagesController {
     content: string;
     status: string | null;
     errorMessage: string | null;
+    modelId: string | null;
     createdAt: Date;
   }) {
     return {
@@ -112,6 +113,9 @@ export class MessagesController {
       content: message.content,
       status: message.status,
       errorMessage: message.errorMessage,
+      // Per-turn model attribution: the client can show which model produced
+      // each assistant response, including after a mid-conversation switch.
+      modelId: message.modelId,
       createdAt: message.createdAt,
     };
   }

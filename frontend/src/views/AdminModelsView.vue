@@ -80,6 +80,22 @@ async function toggleActive(model: AiModel) {
   }
 }
 
+async function toggleFree(model: AiModel) {
+  actionBusy.value = true;
+  try {
+    await api(`/admin/models/${model.id}`, {
+      method: 'PATCH',
+      body: { isFree: !model.isFree },
+    });
+    await load();
+  } catch (e) {
+    // The backend refuses to un-free the default model (400) — surface it.
+    toast.error(e instanceof Error ? e.message : 'عملیات ناموفق بود.');
+  } finally {
+    actionBusy.value = false;
+  }
+}
+
 async function removeModel() {
   const model = pendingDelete.value;
   if (!model) return;
@@ -114,7 +130,7 @@ function logout() {
         <div>
           <h1 class="admin__title">مدیریت مدل‌های هوش مصنوعی</h1>
           <p class="admin__subtitle">
-            مدل‌ها را فعال/غیرفعال کنید و مدل پیش‌فرض گفتگو را انتخاب کنید.
+            مدل‌ها را فعال/غیرفعال کنید، دسترسی رایگان (طرح FREE) را مدیریت کنید و مدل پیش‌فرض گفتگو را انتخاب کنید.
           </p>
         </div>
       </div>
@@ -159,6 +175,7 @@ function logout() {
         :models="models"
         @set-default="setDefault"
         @toggle-active="toggleActive"
+        @toggle-free="toggleFree"
         @remove="pendingDelete = $event"
       />
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-defineProps<{ isDefault?: boolean; isActive: boolean }>();
+defineProps<{ isDefault?: boolean; isActive: boolean; isFree: boolean }>();
 </script>
 
 <template>
@@ -11,6 +11,9 @@ defineProps<{ isDefault?: boolean; isActive: boolean }>();
   </span>
   <span class="model-status" :class="isActive ? 'model-status--active' : 'model-status--inactive'">
     {{ isActive ? 'فعال' : 'غیرفعال' }}
+  </span>
+  <span class="model-status" :class="isFree ? 'model-status--free' : 'model-status--premium'">
+    {{ isFree ? 'رایگان' : 'پریمیوم' }}
   </span>
 </template>
 
@@ -42,5 +45,17 @@ defineProps<{ isDefault?: boolean; isActive: boolean }>();
   background: var(--accent-soft);
   color: var(--text-on-accent-soft);
   border-color: var(--accent-soft-border);
+}
+
+.model-status--free {
+  background: var(--info-soft);
+  color: var(--info);
+  border-color: color-mix(in srgb, var(--info) 25%, transparent);
+}
+
+.model-status--premium {
+  background: var(--warning-soft);
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 25%, transparent);
 }
 </style>
