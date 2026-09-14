@@ -163,6 +163,10 @@ async function send(content: string) {
     createdAt: new Date().toISOString(),
   };
   messages.value.push(optimisticUser, placeholder);
+  // Stream deltas must mutate the row through the array's reactive proxy.
+  // Writing to the raw `placeholder` literal bypasses Vue's proxy, so the
+  // template would never re-render until some unrelated state change.
+  const streamingRow = messages.value[messages.value.length - 1] as Message;
   streaming.value = true;
   pinnedToBottom.value = true;
   await scrollToBottom();
@@ -181,24 +185,24 @@ async function send(content: string) {
       onMeta: ({ userMessage: persisted }) => {
         const optimistic = messages.value.find((m) => m.id === optimisticUser.id);
         if (optimistic) Object.assign(optimistic, persisted);
-        placeholder.modelId = persisted.modelId;
+        streamingRow.modelId = persisted.modelId;
       },
       onDelta: ({ text }) => {
         accumulated += text;
-        placeholder.content = accumulated;
+        streamingRow.content = accumulated;
         void scrollToBottom();
       },
       onDone: ({ assistantMessage }) => {
         // Promote the placeholder to the persisted message (real id/content).
-        Object.assign(placeholder, assistantMessage);
+        Object.assign(streamingRow, assistantMessage);
         finish();
       },
       onError: (message) => {
         // Keep the partial answer visible, marked as failed — the backend
         // has already persisted it with status "error".
-        placeholder.id = `local-error-${Date.now()}`;
-        placeholder.status = 'error';
-        placeholder.errorMessage = message;
+        streamingRow.id = `local-error-${Date.now()}`;
+        streamingRow.status = 'error';
+        streamingRow.errorMessage = message;
         toast.error(message);
         finish();
       },
@@ -208,7 +212,17 @@ async function send(content: string) {
 
 function stopStreaming() {
   streamHandle.value?.abort();
-  // The backend persists the partial answer; the error event finalizes the UI.
+  // The backend persists the partial answer with status "error", but the aborted
+  // connection delivers no further events — finalize the UI state here.
+  const row = streamingMessage.value;
+  if (row) {
+    row.id = `local-stopped-${Date.now()}`;
+    row.status = 'error';
+    if (!row.errorMessage) row.errorMessage = 'تولید پاسخ متوقف شد.';
+  }
+  streaming.value = false;
+  streamHandle.value = null;
+  void loadConversations();
 }
 
 // ---- scrolling: never yank the user back up ----
