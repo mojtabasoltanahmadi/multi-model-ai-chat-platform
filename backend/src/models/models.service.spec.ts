@@ -199,5 +199,19 @@ describe('ModelsService', () => {
         isFree: false,
       });
     });
+
+    it('free access can be granted to a premium model', async () => {
+      repository.findOne.mockResolvedValue(model({ isFree: false }));
+      await expect(service.update('model-1', { isFree: true })).resolves.toMatchObject({
+        isFree: true,
+      });
+    });
+
+    it('a deactivated model can be activated again', async () => {
+      repository.findOne.mockResolvedValue(model({ isActive: false }));
+      await expect(service.update('model-1', { isActive: true })).resolves.toMatchObject({
+        isActive: true,
+      });
+    });
   });
 });

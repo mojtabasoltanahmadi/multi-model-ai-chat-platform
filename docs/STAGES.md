@@ -163,3 +163,48 @@ fixed at the component level (no redesign, no new breakpoints — the existing
 
 Verification: `vue-tsc` clean, build clean, all 8 rules asserted in built CSS chunks,
 48/48 API smoke checks still pass. Rules documented in DESIGN_SYSTEM.md §16.
+
+## Stage 10 — Free AI models & model switching
+
+Goal: admins mark models as Free (usable on the FREE plan, the only plan in the MVP);
+free users can only see and use models that are **active AND free**. Backend authorization
+is the single source of truth.
+
+**Backend**
+- `ai_models.is_free` column (independent of `is_active`: free-configured but disabled is
+  a valid state). Default `true` so existing rows stay usable.
+- `ModelsService.listAvailable(plan)` returns only `isActive AND isFree` for the free plan —
+  the plan-filtered picker list, never the full catalog.
+- `ModelsService.resolveChatModel(modelId?, plan)` — the single chat authorization
+  chokepoint, re-read on every send: unknown → 404, inactive → 400, not allowed for the
+  plan → 403. Direct API calls with a premium `modelId` are rejected; concurrent admin
+  changes are honored because state is read fresh per request.
+- Default-model rules extended: default must be **active + free**. `setDefault` refuses
+  inactive/non-free; deactivating, un-freeing, or deleting the default is refused (400);
+  bootstrap auto-default only picks an active+free model.
+- SSE serialization now includes `modelId` on streamed messages — each assistant message
+  stays attributable to the model that produced it after a mid-conversation switch
+  (history is never rewritten; model is stored per message, `SET NULL` on model delete).
+
+**Frontend**
+- Admin panel: `Free/Premium` badge (`ModelStatus`), a Free toggle switch per row
+  (`ModelTable`), and an `isFree` switch in the create form (`ModelForm`). Backend
+  refusals (e.g. un-freeing the default) surface as toasts.
+- `AiModel` type carries `isFree`; create/update payloads accept it.
+
+**Edge cases covered** (backend unit tests + `scripts/smoke-test.mjs`):
+no active free models → picker shows the empty state (backend returns `[]` without
+crashing); model deactivated or un-freed after selection → next send rejected with
+400/403; unknown model id → 404; premium model via direct API call → 403; default
+disabled/deleted → refused at the admin boundary, so a valid default always exists.
+
+**Verification**: backend jest 55/55 (incl. new model-switching attribution test),
+backend `tsc` clean, `vue-tsc` clean, both production builds clean. Smoke-test script
+extended with free/premium authorization checks (run requires a live backend + DB).
+
+**Decisions**
+- No new entity: `isFree` on `ai_models` (spec: extend, don't create).
+- No separate Free default: one default, constrained to active+free — simplest state
+  that is always valid for free users.
+- `UserPlan = 'free'` parameter kept on the service API so later plans plug into the
+  same chokepoint without refactoring.

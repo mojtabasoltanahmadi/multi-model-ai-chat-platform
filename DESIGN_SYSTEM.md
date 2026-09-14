@@ -244,9 +244,12 @@ Used in sidebar, chat header (mobile), auth brand panel, empty chat, admin heade
   textarea (Enter=send, Shift+Enter=newline), disabled attachment button («به‌زودی»),
   model selector, send/stop, char counter near the 4000 limit, streaming status line.
 * `admin/ModelTable.vue` — dense table ≥768px, stacked cards below. Inactive rows dimmed,
-  default model marked and protected from destructive actions.
-* `admin/ModelStatus.vue` — default (spark) + active/inactive badge pair.
+  default model marked and protected from destructive actions. Free access is a pill
+  toggle (`role="switch"`, info/warning palette) in its own «دسترسی» column.
+* `admin/ModelStatus.vue` — default (spark) + active/inactive badge pair + Free/Premium
+  badge (info `--info` / warning `--warning` soft tints).
 * `admin/ModelForm.vue` — modal form: provider radio cards (mock / OpenAI-compatible),
+  an `isFree` switch (label + explanatory line + knob, `role="switch"`),
   validation, API key note.
 
 ---
@@ -287,7 +290,9 @@ line + stop button; errors: toast + per-message error note.
 ## Admin List
 
 Toolbar (count + primary «افزودن مدل») → table/cards. Loading skeleton; load failure:
-retry ErrorState; destructive actions confirmed in modal; outcome via toast.
+retry ErrorState; destructive actions confirmed in modal; outcome via toast. Switch
+controls (free access) toggle inline via `PATCH` and re-fetch; backend refusals (e.g.
+un-freeing the default model) surface as error toasts.
 
 ---
 

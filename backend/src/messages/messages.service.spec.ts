@@ -154,6 +154,43 @@ describe('MessagesService.streamChatTurn', () => {
     expect(conversationsService.renameTitle).not.toHaveBeenCalled();
   });
 
+  it('attributes each assistant message to the model that produced it when switching models mid-conversation', async () => {
+    setup({
+      history: [
+        { role: 'user', content: 'اول' },
+        { role: 'assistant', content: 'پاسخ با مدل یک' },
+      ],
+    });
+    aiProviderService.streamChat.mockImplementation(async function* () {
+      yield 'ok';
+    });
+
+    // Turn 1 on model-1 (already in history above)…
+    modelsService.resolveChatModel.mockResolvedValueOnce({
+      id: 'model-1',
+      name: 'Mock One',
+      provider: 'mock',
+    });
+    await service.streamChatTurn('user-1', 'conv-1', 'سلام', 'model-1', () => false, callbacks());
+
+    // …turn 2 switches to model-2.
+    modelsService.resolveChatModel.mockResolvedValueOnce({
+      id: 'model-2',
+      name: 'Mock Two',
+      provider: 'mock',
+    });
+    await service.streamChatTurn('user-1', 'conv-1', 'سؤال دوم', 'model-2', () => false, callbacks());
+
+    const assistantRows = messagesRepository.save.mock.calls
+      .map((call) => call[0])
+      .filter((row) => row.role === 'assistant');
+    expect(assistantRows).toHaveLength(2);
+    // Each turn is stamped with the model that answered it — history stays
+    // attributable after a switch and no previous row is rewritten.
+    expect(assistantRows[0]).toMatchObject({ modelId: 'model-1', content: 'ok' });
+    expect(assistantRows[1]).toMatchObject({ modelId: 'model-2', content: 'ok' });
+  });
+
   it('includes the persisted history plus the new message in the provider request', async () => {
     setup({
       history: [
