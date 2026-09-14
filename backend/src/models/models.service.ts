@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { EntityManager, In, Repository } from 'typeorm';
 import { AiModel } from './ai-model.entity';
@@ -7,6 +7,12 @@ import { UpdateModelDto } from './dto/update-model.dto';
 
 /** Shape returned to clients - never includes the provider API key. */
 export type SafeModel = Omit<AiModel, 'apiKey'> & { hasApiKey: boolean };
+
+/**
+ * User plans. The MVP has a single FREE plan; the parameter exists so the
+ * authorization chokepoint is already plan-aware when later plans arrive.
+ */
+export type UserPlan = 'free';
 
 @Injectable()
 export class ModelsService {
@@ -21,17 +27,21 @@ export class ModelsService {
     return models.map((model) => this.toSafeModel(model));
   }
 
-  /** Active models only - the list regular users can pick from when chatting. */
-  async listActive(): Promise<SafeModel[]> {
-    const models = await this.modelsRepository.find({
-      where: { isActive: true },
-      order: { createdAt: 'ASC' },
-    });
+  /**
+   * Models the given plan may actually use - the plan-filtered list the chat
+   * UI offers. The backend is the source of truth: hiding in the frontend is
+   * not authorization (INV-2: active AND allowed for the plan).
+   */
+  async listAvailable(plan: UserPlan = 'free'): Promise<SafeModel[]> {
+    const where =
+      plan === 'free' ? { isActive: true, isFree: true } : { isActive: true };
+    const models = await this.modelsRepository.find({ where, order: { createdAt: 'ASC' } });
     return models.map((model) => this.toSafeModel(model));
   }
 
   async create(dto: CreateModelDto): Promise<SafeModel> {
     const willBeActive = dto.isActive ?? true;
+    const willBeFree = dto.isFree ?? true;
 
     const model = this.modelsRepository.create({
       name: dto.name.trim(),
@@ -40,13 +50,15 @@ export class ModelsService {
       baseUrl: dto.baseUrl?.trim() || null,
       apiKey: dto.apiKey?.trim() || null,
       isActive: willBeActive,
+      isFree: willBeFree,
       isDefault: false,
     });
 
     // Convenience only: the first active model automatically becomes the
-    // default so a fresh installation can chat right away.
+    // default so a fresh installation can chat right away. The default must
+    // satisfy the same rules as setDefault: active AND free.
     const defaultExists = await this.modelsRepository.exists({ where: { isDefault: true } });
-    if (willBeActive && !defaultExists) {
+    if (willBeActive && willBeFree && !defaultExists) {
       model.isDefault = true;
     }
 
@@ -62,6 +74,12 @@ export class ModelsService {
         'مدل پیش‌فرض را نمی‌توان غیرفعال کرد. ابتدا یک مدل دیگر را پیش‌فرض کنید.',
       );
     }
+    // The default model must stay usable by FREE users (INV-3 for defaults).
+    if (dto.isFree === false && model.isDefault) {
+      throw new BadRequestException(
+        'مدل پیش‌فرض باید برای کاربران رایگان در دسترس باشد. ابتدا یک مدل دیگر را پیش‌فرض کنید.',
+      );
+    }
 
     if (dto.name !== undefined) model.name = dto.name.trim();
     if (dto.provider !== undefined) model.provider = dto.provider;
@@ -69,12 +87,13 @@ export class ModelsService {
     if (dto.baseUrl !== undefined) model.baseUrl = dto.baseUrl?.trim() || null;
     if (dto.apiKey !== undefined) model.apiKey = dto.apiKey.trim() || null;
     if (dto.isActive !== undefined) model.isActive = dto.isActive;
+    if (dto.isFree !== undefined) model.isFree = dto.isFree;
 
     return this.toSafeModel(await this.modelsRepository.save(model));
   }
 
   /**
-   * Invariant: at most one default model, and it must be active.
+   * Invariant: at most one default model, and it must be active and free.
    * The swap runs in a transaction so both rows change atomically.
    */
   async setDefault(id: string): Promise<SafeModel> {
@@ -82,6 +101,11 @@ export class ModelsService {
     if (!model) throw new NotFoundException('مدل پیدا نشد.');
     if (!model.isActive) {
       throw new BadRequestException('فقط مدل فعال می‌تواند پیش‌فرض شود.');
+    }
+    if (!model.isFree) {
+      throw new BadRequestException(
+        'مدل پیش‌فرض باید برای کاربران رایگان در دسترس باشد.',
+      );
     }
 
     await this.modelsRepository.manager.transaction(async (entityManager: EntityManager) => {
@@ -105,22 +129,27 @@ export class ModelsService {
   }
 
   /**
-   * Resolves the model for a new chat turn: the requested one (must be active)
-   * or the system default. Inactive/unknown models are never used.
+   * Resolves the model for a new chat turn — the single authorization
+   * chokepoint for chat. The requested model (or the default when none is
+   * given) must exist, be active, AND be allowed for the caller's plan.
+   * Frontend filtering is never trusted; every send re-checks here against
+   * current backend state (concurrent admin changes are honored).
    */
-  async resolveChatModel(modelId?: string): Promise<AiModel> {
-    let model: AiModel | null = null;
-
+  async resolveChatModel(modelId: string | undefined, plan: UserPlan = 'free'): Promise<AiModel> {
     if (modelId) {
-      model = await this.modelsRepository.findOne({ where: { id: modelId } });
+      const model = await this.modelsRepository.findOne({ where: { id: modelId } });
       if (!model) throw new NotFoundException('مدل درخواستی پیدا نشد.');
       if (!model.isActive) {
         throw new BadRequestException('این مدل غیرفعال است و قابل استفاده نیست.');
       }
+      if (plan === 'free' && !model.isFree) {
+        // Premium model requested by a free user (direct API call included).
+        throw new ForbiddenException('این مدل برای طرح شما در دسترس نیست.');
+      }
       return model;
     }
 
-    model = await this.modelsRepository.findOne({ where: { isDefault: true } });
+    const model = await this.modelsRepository.findOne({ where: { isDefault: true } });
     if (!model) {
       throw new BadRequestException(
         'هنوز مدل پیش‌فرضی تنظیم نشده است. با مدیر سیستم تماس بگیرید.',
@@ -128,6 +157,11 @@ export class ModelsService {
     }
     if (!model.isActive) {
       throw new BadRequestException('مدل پیش‌فرض غیرفعال است. با مدیر سیستم تماس بگیرید.');
+    }
+    if (plan === 'free' && !model.isFree) {
+      throw new BadRequestException(
+        'مدل پیش‌فرض برای طرح شما در دسترس نیست. با مدیر سیستم تماس بگیرید.',
+      );
     }
     return model;
   }

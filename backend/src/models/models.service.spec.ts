@@ -13,6 +13,7 @@ describe('ModelsService', () => {
     baseUrl: null,
     apiKey: 'sk-secret',
     isActive: true,
+    isFree: true,
     isDefault: false,
     ...overrides,
   });
@@ -124,6 +125,79 @@ describe('ModelsService', () => {
     it('fails clearly when the default model is inactive', async () => {
       repository.findOne.mockResolvedValue(model({ isDefault: true, isActive: false }));
       await expect(service.resolveChatModel(undefined)).rejects.toMatchObject({ status: 400 });
+    });
+
+    it('rejects a premium (non-free) model requested by a free user with 403', async () => {
+      repository.findOne.mockResolvedValue(model({ isFree: false }));
+      await expect(service.resolveChatModel('model-1', 'free')).rejects.toMatchObject({
+        status: 403,
+      });
+    });
+
+    it('rejects usage after free access is revoked (re-checked on every send)', async () => {
+      // Same model that used to be free; admin has since set isFree = false.
+      repository.findOne.mockResolvedValue(model({ isFree: false }));
+      await expect(service.resolveChatModel('model-1', 'free')).rejects.toMatchObject({
+        status: 403,
+      });
+    });
+
+    it('rejects an inactive premium model with 400 (inactive check first)', async () => {
+      repository.findOne.mockResolvedValue(model({ isFree: false, isActive: false }));
+      await expect(service.resolveChatModel('model-1', 'free')).rejects.toMatchObject({
+        status: 400,
+      });
+    });
+
+    it('fails clearly when the default model is not free', async () => {
+      repository.findOne.mockResolvedValue(model({ isDefault: true, isFree: false }));
+      await expect(service.resolveChatModel(undefined, 'free')).rejects.toMatchObject({
+        status: 400,
+      });
+    });
+  });
+
+  describe('listAvailable (plan-filtered)', () => {
+    it('queries only active AND free models for the free plan', async () => {
+      repository.find.mockResolvedValue([]);
+      await service.listAvailable('free');
+      expect(repository.find).toHaveBeenCalledWith({
+        where: { isActive: true, isFree: true },
+        order: { createdAt: 'ASC' },
+      });
+    });
+  });
+
+  describe('free-access admin rules', () => {
+    it('removing free access from the default model is rejected', async () => {
+      repository.findOne.mockResolvedValue(model({ isDefault: true }));
+      await expect(service.update('model-1', { isFree: false })).rejects.toMatchObject({
+        status: 400,
+      });
+    });
+
+    it('setting a non-free model as default is rejected', async () => {
+      repository.findOne.mockResolvedValue(model({ isFree: false }));
+      await expect(service.setDefault('model-1')).rejects.toMatchObject({ status: 400 });
+    });
+
+    it('does not auto-default a non-free first model', async () => {
+      repository.exists.mockResolvedValue(false);
+      repository.save.mockImplementation(async (data: any) => ({ id: 'model-1', ...data }));
+      const created = await service.create({
+        name: 'Premium',
+        provider: 'mock',
+        externalModelId: 'p-1',
+        isFree: false,
+      } as any);
+      expect(created.isDefault).toBe(false);
+    });
+
+    it('free access can be removed from a non-default model', async () => {
+      repository.findOne.mockResolvedValue(model({}));
+      await expect(service.update('model-1', { isFree: false })).resolves.toMatchObject({
+        isFree: false,
+      });
     });
   });
 });
