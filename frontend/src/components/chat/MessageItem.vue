@@ -9,14 +9,56 @@ interface Props {
   message: Message;
   /** Model name for assistant attribution; fallback «دستیار هوشمند». */
   modelName?: string;
+  /**
+   * True while THIS component is the live-streaming row (its place is
+   * filled by deltas). Distinct from a row whose persisted status is
+   * 'streaming' — the latter means "an answer was being produced when we
+   * last saw the row" and should render with a Retry affordance instead
+   * of a caret.
+   */
   streaming?: boolean;
+  /** Disable the Retry button (e.g. while another send is in flight). */
+  retryDisabled?: boolean;
 }
 
-const props = withDefaults(defineProps<Props>(), { streaming: false, modelName: '' });
+const props = withDefaults(defineProps<Props>(), {
+  streaming: false,
+  modelName: '',
+  retryDisabled: false,
+});
+
+const emit = defineEmits<{ retry: [message: Message] }>();
 
 const copied = ref(false);
 const isUser = computed(() => props.message.role === 'user');
-const isError = computed(() => props.message.status === 'error');
+
+/**
+ * State-driven visuals:
+ *   - 'failed'       → red error surface + Retry button + optional note
+ *   - 'interrupted'  → muted surface + Retry button ("تولید متوقف شد")
+ *   - 'pending'/'streaming' (without live deltas) → muted in-progress hint;
+ *     we don't show the streaming caret because there are no live bytes
+ *   - 'completed'    → full markdown rendering, copy button
+ *   - null           → user row, plain text bubble
+ */
+const isFailed = computed(() => props.message.status === 'failed');
+const isInterrupted = computed(() => props.message.status === 'interrupted');
+const isInProgress = computed(
+  () => props.message.status === 'pending' || props.message.status === 'streaming',
+);
+const statusLabel = computed(() => {
+  if (isFailed.value) return 'خطا در تولید پاسخ';
+  if (isInterrupted.value) return 'تولید پاسخ متوقف شد';
+  if (isInProgress.value) return 'در حال تولید پاسخ';
+  return '';
+});
+
+const canRetry = computed(
+  () =>
+    !props.streaming &&
+    !props.retryDisabled &&
+    (isFailed.value || isInterrupted.value),
+);
 
 const html = computed(() => {
   if (props.message.role !== 'assistant' || props.streaming) return '';
@@ -35,10 +77,15 @@ async function copy() {
     /* clipboard unavailable (e.g. insecure context) — silently ignore */
   }
 }
+
+function retry() {
+  if (!canRetry.value) return;
+  emit('retry', props.message);
+}
 </script>
 
 <template>
-  <article class="message" :class="isUser ? 'message--user' : 'message--assistant'">
+  <article class="message" :class="[isUser ? 'message--user' : 'message--assistant', message.status ? `message--${message.status}` : null]">
     <div v-if="!isUser" class="message__meta">
       <AppAvatar :name="modelName || 'دستیار'" :size="24" />
       <span class="message__author">{{ modelName || 'دستیار هوشمند' }}</span>
@@ -49,7 +96,8 @@ async function copy() {
       class="message__body"
       :class="{
         'message__body--streaming': streaming,
-        'message__body--error': isError,
+        'message__body--failed': isFailed,
+        'message__body--interrupted': isInterrupted,
       }"
       :dir="isUser ? 'auto' : undefined"
     >
@@ -65,10 +113,18 @@ async function copy() {
         <!-- eslint-disable-next-line vue/no-v-html — sanitized: markdown-it runs with html:false -->
         <span v-html="streamingHtml"></span><span class="message__caret" aria-hidden="true"></span>
       </div>
+      <div
+        v-else-if="isInProgress"
+        class="message__content message__content--in-progress"
+        aria-live="polite"
+      >
+        {{ message.content }}
+        <span class="message__dots" aria-hidden="true">…</span>
+      </div>
       <!-- eslint-disable-next-line vue/no-v-html — sanitized: markdown-it runs with html:false -->
       <div v-else class="message__content" v-html="html"></div>
 
-      <p v-if="isError && message.errorMessage" class="message__error-note">
+      <p v-if="(isFailed || isInterrupted) && message.errorMessage" class="message__error-note">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
           <path d="M12 8h.01M12 12v5" />
           <circle cx="12" cy="12" r="9" />
@@ -78,6 +134,22 @@ async function copy() {
     </div>
 
     <div v-if="!isUser && !streaming" class="message__actions">
+      <button
+        v-if="canRetry"
+        type="button"
+        class="message__action message__action--retry"
+        :aria-label="`تلاش مجدد ${statusLabel}`"
+        :title="`تلاش مجدد ${statusLabel}`"
+        @click="retry"
+      >
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 12a9 9 0 0 1 15.5-6.3L21 8" />
+          <path d="M21 3v5h-5" />
+          <path d="M21 12a9 9 0 0 1-15.5 6.3L3 16" />
+          <path d="M3 21v-5h5" />
+        </svg>
+        <span class="message__action-label">تلاش مجدد</span>
+      </button>
       <button
         type="button"
         class="message__action"
@@ -287,8 +359,40 @@ async function copy() {
 }
 
 /* error */
-.message__body--error .message__content {
+.message__body--failed,
+.message__body--interrupted {
+  opacity: 0.92;
+}
+
+.message__body--failed .message__content {
+  color: var(--danger);
+}
+
+.message__body--interrupted .message__content {
   color: var(--text-2);
+  font-style: italic;
+}
+
+.message__content--in-progress {
+  color: var(--text-2);
+  font-style: italic;
+}
+
+.message__dots {
+  display: inline-block;
+  margin-inline-start: 0.15rem;
+  letter-spacing: 0.15em;
+  animation: dots-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes dots-pulse {
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 1;
+  }
 }
 
 .message__error-note {
@@ -308,14 +412,16 @@ async function copy() {
 }
 
 .message__action {
-  display: grid;
-  place-items: center;
-  width: 1.8rem;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
   height: 1.8rem;
+  padding-inline: 0.55rem;
   background: transparent;
   border: none;
   border-radius: var(--radius-xs);
   color: var(--text-3);
+  font-size: 0.74rem;
   transition:
     background var(--motion-fast) var(--ease-out),
     color var(--motion-fast) var(--ease-out);
@@ -324,5 +430,18 @@ async function copy() {
 .message__action:hover {
   background: var(--surface-2);
   color: var(--text-1);
+}
+
+.message__action--retry {
+  color: var(--accent);
+}
+
+.message__action--retry:hover {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+}
+
+.message__action-label {
+  font-weight: 500;
 }
 </style>
