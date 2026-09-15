@@ -25,3 +25,7 @@ __pycache__/
 
 # Coverage
 coverage/
+
+# Tooling artifacts
+.claude/plans/
+.freebuff/

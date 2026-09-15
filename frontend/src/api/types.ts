@@ -22,7 +22,23 @@ export interface Conversation {
 }
 
 export type MessageRole = 'user' | 'assistant';
-export type MessageStatus = 'completed' | 'error';
+/**
+ * Lifecycle of an assistant turn. Persisted on the backend row, so a refresh
+ * mid-stream can read the latest value from PostgreSQL instead of guessing.
+ *  - 'pending'    : row exists, AI has not started yet
+ *  - 'streaming'  : AI is producing deltas (in-memory on the server)
+ *  - 'completed'  : AI finished successfully
+ *  - 'interrupted': client disconnected mid-stream; partial content kept
+ *  - 'failed'     : AI call failed; errorMessage has the detail
+ *
+ * User rows have status = null.
+ */
+export type MessageStatus =
+  | 'pending'
+  | 'streaming'
+  | 'completed'
+  | 'interrupted'
+  | 'failed';
 
 export interface Message {
   id: string;
@@ -32,6 +48,8 @@ export interface Message {
   status: MessageStatus | null;
   errorMessage: string | null;
   modelId: string | null;
+  /** Client-generated idempotency token; present on user rows. */
+  clientMessageId: string | null;
   createdAt: string;
 }
 
@@ -55,6 +73,16 @@ export interface AiModel {
 export interface SendMessagePayload {
   content: string;
   modelId?: string;
+  /**
+   * Client-generated idempotency token (≤ 64 chars). Two requests with the
+   * same token for the same conversation reuse the original user row and
+   * emit `replay: true` in the meta event. If the same token is reused with
+   * different content, the backend rejects with 400.
+   *
+   * Optional: when omitted, `Idempotency-Key` HTTP header is also accepted
+   * by the backend as a fallback.
+   */
+  clientMessageId?: string;
 }
 
 export interface CreateModelPayload {

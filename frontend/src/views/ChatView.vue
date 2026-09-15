@@ -9,13 +9,15 @@ import AppSkeleton from '../components/ui/AppSkeleton.vue';
 import { api, streamChatMessage, type StreamHandle } from '../api/client';
 import type { AiModel, Conversation, Message } from '../api/types';
 import { useToast } from '../composables/useToast';
+import { useOnline } from '../composables/useOnline';
 
 const toast = useToast();
+const { online } = useOnline();
 
 // ---- data ----
 const conversations = ref<Conversation[]>([]);
 const conversationsLoading = ref(true);
-const activeId = ref<string | null>(null);
+const activeId = ref<string | null>(readActiveConversationPreference());
 const messages = ref<Message[]>([]);
 const messagesLoading = ref(false);
 const models = ref<AiModel[]>([]);
@@ -43,10 +45,35 @@ watch(sidebarCollapsed, (value) => {
   }
 });
 
+/** Last-opened conversation id; restored on refresh so the user lands back where they were. */
+const ACTIVE_CONV_KEY = 'hooshyar.active-conversation';
+function readActiveConversationPreference(): string | null {
+  try {
+    const value = localStorage.getItem(ACTIVE_CONV_KEY);
+    return value && /^[0-9a-f-]{36}$/i.test(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+watch(activeId, (value) => {
+  try {
+    if (value) localStorage.setItem(ACTIVE_CONV_KEY, value);
+    else localStorage.removeItem(ACTIVE_CONV_KEY);
+  } catch {
+    /* private mode — keep state in memory only */
+  }
+});
+
 // streaming placeholder id inside the messages list
 const STREAM_ID = '__streaming__';
 const streaming = ref(false);
 const streamHandle = ref<StreamHandle | null>(null);
+/**
+ * clientMessageId of the in-flight send. Stored so a stop/abort/error path
+ * can recover: the backend already persisted the user row with this id, so
+ * the next refresh reads it back without losing the user's intent.
+ */
+const inflightClientMessageId = ref<string | null>(null);
 
 const completedMessages = computed(() =>
   messages.value.filter((message) => message.id !== STREAM_ID),
@@ -63,6 +90,12 @@ const activeModel = computed(
 
 onMounted(async () => {
   await Promise.all([loadConversations(), loadModels()]);
+  // Restore the last-opened conversation if it still belongs to the user.
+  if (activeId.value && conversations.value.some((c) => c.id === activeId.value)) {
+    await loadMessages();
+  } else {
+    activeId.value = null;
+  }
 });
 
 async function loadConversations() {
@@ -128,7 +161,19 @@ function startNewConversation() {
 }
 
 // ---- sending / streaming ----
-async function send(content: string) {
+/**
+ * Generates a client-side idempotency token. Format: `<prefix>-<base36 ts>-<rand>`.
+ * Stays under the 64-char backend limit, is sortable by creation time, and the
+ * random suffix prevents accidental collisions if a refresh fires a send within
+ * the same millisecond.
+ */
+function newClientMessageId(): string {
+  const ts = Date.now().toString(36);
+  const rand = Math.floor(Math.random() * 0xffffff).toString(36).padStart(4, '0');
+  return `cm-${ts}-${rand}`;
+}
+
+async function send(content: string, options: { clientMessageId?: string } = {}) {
   if (streaming.value) return;
   error.value = '';
 
@@ -142,14 +187,21 @@ async function send(content: string) {
   const conversationId = activeId.value;
   if (!conversationId) return;
 
+  // Reuse the same id when this is a Retry of a previous turn; generate a
+  // fresh one otherwise. The backend treats a matching id + matching content
+  // as a replay (same user row, new assistant row).
+  const clientMessageId = options.clientMessageId ?? newClientMessageId();
+  inflightClientMessageId.value = clientMessageId;
+
   const optimisticUser: Message = {
-    id: `local-${Date.now()}`,
+    id: `local-${clientMessageId}`,
     conversationId,
     role: 'user',
     content,
     status: null,
     errorMessage: null,
     modelId: null,
+    clientMessageId,
     createdAt: new Date().toISOString(),
   };
   const placeholder: Message = {
@@ -157,9 +209,10 @@ async function send(content: string) {
     conversationId,
     role: 'assistant',
     content: '',
-    status: null,
+    status: 'pending',
     errorMessage: null,
     modelId: null,
+    clientMessageId: null,
     createdAt: new Date().toISOString(),
   };
   messages.value.push(optimisticUser, placeholder);
@@ -175,21 +228,27 @@ async function send(content: string) {
   const finish = () => {
     streaming.value = false;
     streamHandle.value = null;
+    inflightClientMessageId.value = null;
     void loadConversations(); // refresh titles and ordering
   };
 
   streamHandle.value = streamChatMessage(
     conversationId,
-    { content, modelId: selectedModelId.value || undefined },
+    { content, modelId: selectedModelId.value || undefined, clientMessageId },
     {
-      onMeta: ({ userMessage: persisted }) => {
+      onMeta: (meta) => {
         const optimistic = messages.value.find((m) => m.id === optimisticUser.id);
-        if (optimistic) Object.assign(optimistic, persisted);
-        streamingRow.modelId = persisted.modelId;
+        if (optimistic) Object.assign(optimistic, meta.userMessage);
+        // The pre-persisted assistant row replaces the optimistic placeholder:
+        // its id is real, its status is 'pending' (server flips it on first delta).
+        streamingRow.id = meta.assistantMessage.id;
+        streamingRow.status = 'streaming';
+        streamingRow.modelId = meta.assistantMessage.modelId ?? meta.model.id;
       },
       onDelta: ({ text }) => {
         accumulated += text;
         streamingRow.content = accumulated;
+        streamingRow.status = 'streaming';
         void scrollToBottom();
       },
       onDone: ({ assistantMessage }) => {
@@ -198,30 +257,60 @@ async function send(content: string) {
         finish();
       },
       onError: (message) => {
-        // Keep the partial answer visible, marked as failed — the backend
-        // has already persisted it with status "error".
+        // The backend has persisted the partial answer with status='failed'.
+        // Pull the latest persisted state so the row reflects what the DB
+        // has, instead of a locally-fabricated one.
         streamingRow.id = `local-error-${Date.now()}`;
-        streamingRow.status = 'error';
+        streamingRow.status = 'failed';
         streamingRow.errorMessage = message;
         toast.error(message);
         finish();
+        void loadMessages();
       },
     },
   );
 }
 
+/** Retry a non-terminal assistant row by re-sending its user prompt with the same id. */
+function retry(message: Message) {
+  if (streaming.value) return;
+  if (message.role !== 'assistant') return;
+  if (message.status !== 'failed' && message.status !== 'interrupted') return;
+
+  // Find the user row immediately preceding this assistant row (chronologically).
+  const index = messages.value.findIndex((m) => m.id === message.id);
+  if (index <= 0) return;
+  const userRow = messages.value
+    .slice(0, index)
+    .reverse()
+    .find((m) => m.role === 'user');
+  if (!userRow?.content) return;
+
+  // Remove the failed/interrupted assistant row so the optimistic stream
+  // doesn't double the visible assistant bubble for this turn.
+  messages.value.splice(index, 1);
+
+  // The original user row already carries its clientMessageId (persisted).
+  // Reusing it lets the backend recognise this as a replay and produce a
+  // fresh assistant row without duplicating the user row.
+  void send(userRow.content, { clientMessageId: userRow.clientMessageId ?? undefined });
+}
+
 function stopStreaming() {
   streamHandle.value?.abort();
-  // The backend persists the partial answer with status "error", but the aborted
-  // connection delivers no further events — finalize the UI state here.
+  // The aborted connection delivers no further events; the backend has
+  // already persisted the partial answer with status='interrupted' (no
+  // error event is emitted for disconnects). Reflect that locally and
+  // reload so the row matches the DB.
   const row = streamingMessage.value;
   if (row) {
-    row.id = `local-stopped-${Date.now()}`;
-    row.status = 'error';
+    row.status = 'interrupted';
     if (!row.errorMessage) row.errorMessage = 'تولید پاسخ متوقف شد.';
   }
   streaming.value = false;
   streamHandle.value = null;
+  inflightClientMessageId.value = null;
+  void loadMessages();
   void loadConversations();
 }
 
@@ -269,6 +358,13 @@ async function scrollToBottom(force = false) {
         @open-menu="drawerOpen = true"
       />
 
+      <Transition name="slide-down">
+        <div v-if="!online" class="chat__offline-banner" role="status" aria-live="polite">
+          <span class="chat__offline-dot" aria-hidden="true"></span>
+          ارتباط اینترنت قطع است. پیام‌های در حال ارسال پس از برقراری دوباره قابل بازیابی هستند.
+        </div>
+      </Transition>
+
       <div ref="scroller" class="chat__messages" @scroll.passive="onScroll">
         <EmptyChat v-if="!activeId && !conversationsLoading" @pick="send" />
 
@@ -284,6 +380,8 @@ async function scrollToBottom(force = false) {
             :key="message.id"
             :message="message"
             :model-name="models.find((m) => m.id === message.modelId)?.name"
+            :retry-disabled="streaming"
+            @retry="retry"
           />
           <MessageItem
             v-if="streamingMessage"
@@ -333,6 +431,48 @@ async function scrollToBottom(force = false) {
   flex: 1;
   overflow-y: auto;
   padding: 1.6rem 1.5rem;
+}
+
+.chat__offline-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.55rem 1.2rem;
+  font-size: 0.78rem;
+  color: var(--text-2);
+  background: color-mix(in srgb, var(--danger) 8%, var(--surface));
+  border-bottom: 1px solid color-mix(in srgb, var(--danger) 18%, transparent);
+}
+
+.chat__offline-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 999px;
+  background: var(--danger);
+  animation: offline-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes offline-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.slide-down-enter-active,
+.slide-down-leave-active {
+  transition:
+    transform var(--motion-normal) var(--ease-out),
+    opacity var(--motion-normal) var(--ease-out);
+}
+
+.slide-down-enter-from,
+.slide-down-leave-to {
+  transform: translateY(-100%);
+  opacity: 0;
 }
 
 .chat__stream {
