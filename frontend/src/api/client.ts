@@ -167,7 +167,10 @@ export function streamChatMessage(
         if (event === 'meta') events.onMeta(parsed as StreamMetaPayload);
         else if (event === 'delta') events.onDelta(parsed as { text: string });
         else if (event === 'done') events.onDone(parsed as { assistantMessage: Message });
-        else if (event === 'error') events.onError(String((parsed as { message?: unknown })?.message ?? 'خطا'));
+        // Terminal failure is emitted as `failed` by the backend; `error` is
+        // kept as a defensive fallback for older payloads.
+        else if (event === 'failed' || event === 'error')
+          events.onError(String((parsed as { message?: unknown })?.message ?? 'خطا'));
       } catch {
         /* ignore malformed keep-alive lines */
       }
