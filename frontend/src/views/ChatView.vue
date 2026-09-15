@@ -6,7 +6,7 @@ import EmptyChat from '../components/chat/EmptyChat.vue';
 import MessageItem from '../components/chat/MessageItem.vue';
 import MessageComposer from '../components/chat/MessageComposer.vue';
 import AppSkeleton from '../components/ui/AppSkeleton.vue';
-import { api, streamChatMessage, type StreamHandle } from '../api/client';
+import { api, streamChatMessage, reconnectGenerationStream, type StreamHandle } from '../api/client';
 import type { AiModel, Conversation, Message } from '../api/types';
 import { useToast } from '../composables/useToast';
 import { useOnline } from '../composables/useOnline';
@@ -64,10 +64,16 @@ watch(activeId, (value) => {
   }
 });
 
-// streaming placeholder id inside the messages list
+// streaming placeholder id inside the messages list (optimistic send only)
 const STREAM_ID = '__streaming__';
 const streaming = ref(false);
 const streamHandle = ref<StreamHandle | null>(null);
+/**
+ * The message row currently being streamed into — either the optimistic
+ * placeholder of a fresh send, or a persisted row being recovered via the
+ * reconnect stream (refresh / new tab / restored network).
+ */
+const activeStreamRowId = ref<string | null>(null);
 /**
  * clientMessageId of the in-flight send. Stored so a stop/abort/error path
  * can recover: the backend already persisted the user row with this id, so
@@ -76,10 +82,10 @@ const streamHandle = ref<StreamHandle | null>(null);
 const inflightClientMessageId = ref<string | null>(null);
 
 const completedMessages = computed(() =>
-  messages.value.filter((message) => message.id !== STREAM_ID),
+  messages.value.filter((message) => message.id !== activeStreamRowId.value),
 );
 const streamingMessage = computed(
-  () => messages.value.find((message) => message.id === STREAM_ID) ?? null,
+  () => messages.value.find((message) => message.id === activeStreamRowId.value) ?? null,
 );
 const activeConversation = computed(
   () => conversations.value.find((conversation) => conversation.id === activeId.value) ?? null,
@@ -147,6 +153,17 @@ async function loadMessages() {
     );
     messages.value = result.messages;
     await scrollToBottom(true);
+
+    // Recovery: an assistant row still pending/streaming means a generation
+    // is (or was) running server-side — re-attach instead of regenerating.
+    // Latest unfinished row only; completed/failed/interrupted rows load as-is.
+    const recoverable = [...result.messages]
+      .reverse()
+      .find(
+        (m) =>
+          m.role === 'assistant' && (m.status === 'pending' || m.status === 'streaming'),
+      );
+    if (recoverable) void recoverGeneration(recoverable);
   } catch (e) {
     error.value = e instanceof Error ? e.message : 'خطا';
   } finally {
@@ -221,6 +238,7 @@ async function send(content: string, options: { clientMessageId?: string } = {})
   // template would never re-render until some unrelated state change.
   const streamingRow = messages.value[messages.value.length - 1] as Message;
   streaming.value = true;
+  activeStreamRowId.value = STREAM_ID;
   pinnedToBottom.value = true;
   await scrollToBottom();
 
@@ -228,6 +246,7 @@ async function send(content: string, options: { clientMessageId?: string } = {})
   const finish = () => {
     streaming.value = false;
     streamHandle.value = null;
+    activeStreamRowId.value = null;
     inflightClientMessageId.value = null;
     void loadConversations(); // refresh titles and ordering
   };
@@ -271,6 +290,62 @@ async function send(content: string, options: { clientMessageId?: string } = {})
   );
 }
 
+/**
+ * Recovery path: a persisted assistant row is still pending/streaming after a
+ * conversation load (refresh mid-stream, new tab, restored network). Attach
+ * to the live generation via the reconnect stream: the snapshot REPLACES the
+ * row content, subsequent deltas APPEND — the backend guarantees the two
+ * never overlap, so no token is duplicated and the answer completes from the
+ * generation that is already running server-side. The AI is never re-invoked.
+ */
+function recoverGeneration(row: Message) {
+  if (streaming.value) return;
+  const conversationId = activeId.value;
+  if (!conversationId) return;
+  const reactiveRow = messages.value.find((m) => m.id === row.id);
+  if (!reactiveRow) return;
+
+  streaming.value = true;
+  activeStreamRowId.value = row.id;
+  pinnedToBottom.value = true;
+
+  const finish = () => {
+    streaming.value = false;
+    streamHandle.value = null;
+    activeStreamRowId.value = null;
+    void loadConversations();
+  };
+
+  streamHandle.value = reconnectGenerationStream(conversationId, row.id, {
+    onSnapshot: (assistantMessage) => {
+      Object.assign(reactiveRow, assistantMessage);
+      void scrollToBottom(true);
+    },
+    onDelta: ({ text }) => {
+      reactiveRow.content += text;
+      reactiveRow.status = 'streaming';
+      void scrollToBottom();
+    },
+    onDone: (assistantMessage) => {
+      Object.assign(reactiveRow, assistantMessage);
+      finish();
+    },
+    onFailed: (assistantMessage, message) => {
+      if (assistantMessage) {
+        // Orphaned (server restart) or failed generation — the row carries
+        // the honest terminal state from the DB.
+        Object.assign(reactiveRow, assistantMessage);
+      } else {
+        // Network-level failure while reconnecting — keep the row as-is;
+        // the next reload retries the recovery.
+        reactiveRow.status = 'interrupted';
+      }
+      toast.error(message);
+      finish();
+    },
+  });
+}
+
 /** Retry a non-terminal assistant row by re-sending its user prompt with the same id. */
 function retry(message: Message) {
   if (streaming.value) return;
@@ -298,19 +373,20 @@ function retry(message: Message) {
 
 function stopStreaming() {
   streamHandle.value?.abort();
-  // The aborted connection delivers no further events; the backend has
-  // already persisted the partial answer with status='interrupted' (no
-  // error event is emitted for disconnects). Reflect that locally and
-  // reload so the row matches the DB.
+  // Aborting only detaches THIS view from the live stream — the generation
+  // keeps running server-side and its full answer is persisted. The row is
+  // shown locally as detached; the next load of this conversation reads the
+  // final state from the database (or re-attaches if still generating).
   const row = streamingMessage.value;
   if (row) {
     row.status = 'interrupted';
-    if (!row.errorMessage) row.errorMessage = 'تولید پاسخ متوقف شد.';
+    row.errorMessage = null;
   }
   streaming.value = false;
   streamHandle.value = null;
+  activeStreamRowId.value = null;
   inflightClientMessageId.value = null;
-  void loadMessages();
+  void loadConversations();
   void loadConversations();
 }
 
