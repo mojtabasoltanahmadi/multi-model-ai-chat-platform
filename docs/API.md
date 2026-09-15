@@ -88,17 +88,60 @@ Provider error (timeout, 5xx, refused connection). Partial content is persisted 
 generic message:
 
 ```
-event: error
-data: { "message": "سرویس هوش مصنوعی موقتاً در دسترس نیست. لطفاً دوباره تلاش کنید." }
+event: failed
+data: { "assistantMessage": { status: "failed", ... }, "message": "سرویس هوش مصنوعی موقتاً در دسترس نیست. لطفاً دوباره تلاش کنید." }
 ```
 
-Client disconnect (browser tab closed, network dropped, Stop button). **No `error`
-event is emitted** — the disconnector cannot receive it. The server persists the partial
-answer with `status: "interrupted"` and no `errorMessage`. The next `GET` on the
-conversation surfaces the row as a Retry target.
+Client disconnect (browser tab closed, network dropped, refresh). **No error event is
+emitted and the generation is NOT stopped** — disconnect ≠ failure. The HTTP connection
+merely unsubscribes from the generation; the AI loop keeps running, keeps persisting
+progress, and the row finishes as `status: "completed"`. A client that went away can
+re-attach via the reconnect endpoint below and receive the rest of the answer without
+regenerating anything.
 
 The full state machine and disambiguation rules live in
 [CONVERSATION_RESILIENCE.md](CONVERSATION_RESILIENCE.md).
+
+### Reconnect / recovery stream
+
+`GET /conversations/:conversationId/messages/:messageId/stream` — the recovery stream
+for a client that lost its live connection (refresh mid-stream, closed tab, network
+drop, or a second tab opening the same conversation).
+
+Pre-flight (before SSE headers): 404 for an unknown/foreign conversation or a message
+that is not an assistant row of that conversation.
+
+Events, in order:
+
+```
+event: snapshot
+data: { "assistantMessage": { content: "<full content so far>", status, ... } }
+
+// live generation only:
+event: delta
+data: { "text": "chunk" }      // the remaining deltas, never overlapping the snapshot
+
+// always exactly one terminal event:
+event: done
+  → { "assistantMessage": { status: "completed", ... } }
+event: failed
+  → { "assistantMessage": { status: "failed" | "interrupted", ... }, "message": "<generic>" }
+```
+
+Recovery behavior by row state:
+
+| Row state on the server | Behavior |
+|---|---|
+| Live generation in progress | `snapshot` + remaining `delta`s + terminal. The client joins the **same** generation — the AI is never re-invoked. |
+| `completed` | `snapshot` + `done`. Pure replay, no AI call. |
+| `failed` | `snapshot` + `failed` (generic message). Retry is a user action. |
+| `interrupted` (user pressed Stop) | `snapshot` + `failed` (generic message). Retry is a user action. |
+| `pending`/`streaming` with **no** live generation (server restarted mid-generation) | The row is honestly marked `interrupted` in the DB, then `snapshot` + `failed` with a "you can retry" message. No fake resume. |
+
+Snapshot/delta ordering guarantee: the server subscribes the reconnecting client
+**before** reading its content buffer, so a token is either in the snapshot or in a
+delta — never both, never neither. `snapshot + deltas` concatenates exactly to the
+persisted content.
 
 ### Message shape
 

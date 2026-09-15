@@ -311,3 +311,52 @@ header round-trip, content-mismatch → 400). `scripts/resilience-test.mjs`
   "regenerate" surface will reuse the same code path with different copy.
 - No client-side retry queue — Retry is a deliberate user action. We never
   silently re-send.
+
+## Stage 12 — Detached generation + reconnect stream
+
+Backend (commit 01021fd):
+- `GenerationRegistry`: in-process fan-out of delta/done/failed events plus an
+  authoritative content buffer for reconnect snapshots.
+- `beginChatTurn` + detached `runGeneration`: the AI loop is decoupled from the
+  HTTP response. Client disconnect (refresh, closed tab, network loss) only
+  unsubscribes — the generation continues, persists progress (status flips to
+  `streaming` on the first token; content flushed on a 1.5s throttle,
+  `AI_PERSIST_INTERVAL_MS`), and always reaches a persisted terminal state.
+- `GET /conversations/:id/messages/:messageId/stream`: recovery stream.
+  Subscribe-first/snapshot-second ordering guarantees no token is lost or
+  duplicated. Completed rows replay as snapshot+done without re-invoking the
+  AI; orphaned pending/streaming rows (server restart) are honestly marked
+  `interrupted` and offered for retry.
+- Terminal SSE event renamed `error` → `failed` and now carries the persisted
+  `assistantMessage` alongside the generic client message.
+
+Frontend (commits 14fe127 and the follow-up hardening):
+- `reconnectGenerationStream` client (GET SSE reader; snapshot REPLACES,
+  deltas APPEND).
+- ChatView: after every conversation load, the latest pending/streaming
+  assistant row auto-attaches to the live generation. `activeStreamRowId`
+  generalizes the streaming slot (optimistic placeholder or persisted row).
+- Follow-up fixes: retry no longer duplicates the user bubble
+  (`existingUserRowId`); a transport drop after deltas arrived no longer
+  fabricates a `failed` row — tokens are kept, the row renders `interrupted`
+  locally, and a `watch(online)` hook re-attaches to the same generation when
+  connectivity returns; the SSE dispatcher handles the `failed` event name
+  (previously only `error`, so terminal failures left the UI streaming
+  forever); Stop no longer double-refreshes the sidebar.
+
+Verification:
+- backend jest 69/69
+- scripts/smoke-test.mjs 75/75
+- scripts/resilience-test.mjs 28/28 (rewritten for the detached contract:
+  abort→completes, completed-replay, two-clients-one-generation with exact
+  snapshot+delta equality, ownership 404s, replay row counts, pre-delta abort)
+- vue-tsc --noEmit clean; frontend production build clean
+
+Decisions:
+- Snapshot-based reconnect instead of the drafted Last-Event-ID cursor design
+  (docs/superpowers/specs/2026-09-15-conversation-stream-resume-design.md,
+  marked superseded): no event ids, no ring buffer, no 410s, no schema change.
+- No auto-retry-on-return: with detached generation there is no "interrupted
+  on refresh" state to auto-retry; orphaned rows surface an explicit retry.
+- Token-level provider resume is impossible with stateless completion APIs;
+  the honest fallback (interrupted + retry) is documented, not faked.

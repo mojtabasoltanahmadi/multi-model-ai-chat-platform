@@ -254,10 +254,16 @@ paths:
            no default configured → `400 NO_DEFAULT_MODEL`
 
         Then the stream opens (see the Streaming section in the API info):
-        `meta` → `delta`* → `done` | `error`. Exactly one assistant message is
+        `meta` → `delta`* → `done` | `failed`. Exactly one assistant message is
         persisted per turn in every outcome (INV-5). The provider request is
         aborted after the configured timeout (A-8, default 60s) and surfaces as
-        the generic `error` terminal event.
+        the generic `failed` terminal event.
+
+        The generation runs DETACHED from this HTTP response: a client
+        disconnect (refresh, closed tab, network loss) only unsubscribes — the
+        AI keeps generating and the row completes in the DB. A returning
+        client re-attaches via
+        `/conversations/{conversationId}/messages/{messageId}/stream`.
 
         The first message of an untitled conversation auto-sets its title (A-7).
       parameters:
@@ -281,14 +287,15 @@ paths:
           description: |
             SSE stream (`text/event-stream`). Event payloads use the
             `StreamMetaEvent`, `StreamDeltaEvent`, `StreamDoneEvent`, and
-            `StreamErrorEvent` schemas documented in components.
+            `StreamFailedEvent` schemas documented in components.
 
-            Disconnect handling: if the client disconnects mid-stream, the
-            server persists the partial answer with `status = "interrupted"`
-            and closes silently (no `error` event is emitted — the
-            disconnector cannot receive it). Provider / network failures
-            persist with `status = "failed"` and emit a generic
-            `StreamErrorEvent`. See
+            Disconnect handling: disconnect ≠ failure. The generation is
+            detached from the HTTP connection, so a mid-stream disconnect only
+            unsubscribes the client — the generation continues, keeps
+            persisting progress, and finishes `completed`. No error event is
+            emitted to the disconnector (it cannot receive one). Provider /
+            network failures persist with `status = "failed"` and emit a
+            generic `StreamFailedEvent`. See
             `docs/CONVERSATION_RESILIENCE.md` §5 for the disambiguation.
           content:
             text/event-stream:
@@ -322,6 +329,62 @@ paths:
                 $ref: '#/components/schemas/Error'
         '500':
           $ref: '#/components/responses/InternalError'
+
+  /conversations/{conversationId}/messages/{messageId}/stream:
+    get:
+      tags: [Chat]
+      operationId: reconnectGenerationStream
+      summary: Reconnect to an assistant message's generation (SSE recovery stream)
+      description: |
+        Recovery stream for a client that lost its live connection — refresh
+        mid-stream, closed tab, restored network, or a second tab opening the
+        same conversation. Never re-invokes the AI:
+
+        - live generation → `StreamSnapshotEvent` + remaining
+          `StreamDeltaEvent`s + `StreamDoneEvent`/`StreamFailedEvent`
+        - `completed` row → snapshot + done (pure replay)
+        - `failed`/`interrupted` row → snapshot + `StreamFailedEvent`
+        - `pending`/`streaming` row with NO live generation (server restarted
+          mid-generation) → the row is honestly marked `interrupted` in the DB,
+          then snapshot + `StreamFailedEvent`; the client can retry
+
+        Subscribe-first/snapshot-second ordering guarantees no token is lost
+        or duplicated: snapshot + deltas concatenate exactly to the persisted
+        content.
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+        - name: messageId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: |
+            SSE stream (`text/event-stream`): `snapshot` → `delta`* →
+            `done` | `failed`.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                event: snapshot
+                data: {"assistantMessage":{"id":"17d53156-1e46-4c61-b444-3ba9506b2d0b","role":"assistant","content":"سلام! این یک","status":"streaming","errorMessage":null}}
+
+                event: delta
+                data: {"text":"پاسخ آزمایشی است."}
+
+                event: done
+                data: {"assistantMessage":{"id":"17d53156-1e46-4c61-b444-3ba9506b2d0b","role":"assistant","content":"سلام! این یک پاسخ آزمایشی است.","status":"completed","errorMessage":null}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Unknown/foreign conversation, or the message is not an assistant row of it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   /models:
     get:
@@ -952,21 +1015,37 @@ components:
         assistantMessage:
           $ref: '#/components/schemas/Message'
 
-    StreamErrorEvent:
+    StreamFailedEvent:
       type: object
-      required: [message]
+      required: [assistantMessage, message]
       description: |
-        Terminal failure event. A partial assistant message with
-        `status = "failed"` has been persisted. Message is generic Persian
-        text; never contains provider details.
+        Terminal failure event. The partial assistant message has been
+        persisted with `status = "failed"` (provider/network failure) or
+        `status = "interrupted"` (generation orphaned by a server restart,
+        surfaced via the reconnect stream). Message is generic Persian text;
+        never contains provider details.
 
         NOT emitted on client disconnect — the disconnector cannot receive
-        it. The server persists the partial answer with `status = "interrupted"`
-        and the next `GET` surfaces the row as a Retry target.
+        it, and a disconnect does not fail the generation anyway. The row
+        completes in the DB and is recoverable via the reconnect stream.
       properties:
+        assistantMessage:
+          $ref: '#/components/schemas/Message'
         message:
           type: string
           example: 'سرویس هوش مصنوعی موقتاً در دسترس نیست. لطفاً دوباره تلاش کنید.'
+
+    StreamSnapshotEvent:
+      type: object
+      required: [assistantMessage]
+      description: |
+        Reconnect-stream only; always the first event. Carries the assistant
+        row with the FULL content accumulated so far — the client REPLACES its
+        copy with this (never appends). Every later delta is guaranteed to be
+        new: a token is either in the snapshot or in a delta, never both.
+      properties:
+        assistantMessage:
+          $ref: '#/components/schemas/Message'
 
     # ---- Error contract ----
     Error:

@@ -16,14 +16,15 @@ with a usable conversation on their next visit:
 
 | # | Event | Required outcome |
 |---|---|---|
-| 1 | User refreshes the browser mid-stream | Conversation reloads with the last completed turns; the in-flight assistant row shows a Retry button (no orphaned "loading forever" placeholder). |
-| 2 | User closes the tab mid-stream | Next visit to the same conversation: same as #1. The user row is already persisted, so the user's intent is never lost. |
-| 3 | User opens a second tab on the same conversation | Second tab shows the last persisted state. It cannot duplicate the user's message or fabricate AI text. |
-| 4 | Internet drops mid-stream | Server persists the partial answer with `status='interrupted'`. The offline banner explains why the UI is "stuck". When the network returns, the user can Retry. |
+| 1 | User refreshes the browser mid-stream | Conversation reloads; the latest pending/streaming assistant row auto-attaches to the still-running generation via the reconnect stream and finishes streaming. No Retry click, no regenerated content. |
+| 2 | User closes the tab mid-stream | The generation keeps running server-side and completes in the DB. Next visit: the completed answer is simply there. |
+| 3 | User opens a second tab on the same conversation | Second tab joins the SAME live generation (snapshot + remaining deltas). It cannot duplicate the user's message, fabricate AI text, or start a second generation. |
+| 4 | Internet drops mid-stream | The generation continues server-side. The client keeps the tokens already delivered, marks the row locally `interrupted` (a view hint, not a DB state), and when connectivity returns the row auto-re-attaches to the live generation and finishes. |
 | 5 | Provider errors out (timeout, 5xx, refused connection) | Server persists the partial answer with `status='failed'` and an internal `errorMessage`. The client gets a generic, non-leaky message. Retry produces a fresh assistant row. |
-| 6 | User hits Stop (abort) | Same as #4 — `status='interrupted'`. No error event is emitted (the disconnector can't receive it anyway). |
+| 6 | User hits Stop (abort) | This view detaches from the live stream; the generation still completes server-side and is persisted. The row renders locally as `interrupted`; a reload or reconnect shows the real (completed) state. |
 | 7 | User double-clicks Send | The second click is rejected (`streaming.value === true` guard on the client). |
 | 8 | Network blip causes the same POST to retry | Backend recognizes the idempotency key, reuses the user row, streams a fresh assistant. No duplicate user bubble. |
+| 9 | Server restarts mid-generation | The in-memory generation is lost — no fake resume. The orphaned `pending`/`streaming` row is honestly marked `interrupted` on the next reconnect attempt and offered for retry. |
 
 ---
 
@@ -51,10 +52,10 @@ The `messages.status` column is a small enum on the assistant role:
        ┌──────────┐
        │ pending  │  pre-persisted, AI not started yet (DB row exists)
        └────┬─────┘
-            │ first AI delta arrives (in-memory flip on the server)
+            │ first AI delta arrives (persisted immediately)
             ▼
        ┌──────────┐
-       │ streaming│  AI is producing bytes (in-memory on the server)
+       │ streaming│  AI is producing bytes (persisted; content flushed on a 1.5s throttle)
        └────┬─────┘
             │
    ┌────────┼─────────────────────┐
@@ -62,18 +63,24 @@ The `messages.status` column is a small enum on the assistant role:
 ┌────────┐ ┌──────────┐    ┌──────────┐
 │completed│ │interrupted│    │ failed   │
 └────────┘ └──────────┘    └──────────┘
-  success    client gone     provider / network
-             (no error        failure (error event
-              event)          with generic message)
+  success    orphaned by a     provider / network
+             server restart,    failure (failed event
+             or the user's      with generic message)
+             view detached
 ```
 
 `pending` is written **before** the SSE `meta` event is emitted — a reload
 between the POST and the first delta still finds the row.
 
-`streaming` is flipped in memory on the first delta (and on the
-`streamingRow.status` in the client). It is **not** persisted on every
-chunk — only at terminal transitions. The live bytes in flight are the
-SSE deltas, not the DB.
+`streaming` is persisted on the first delta and the content is flushed on a
+1.5s throttle (`AI_PERSIST_INTERVAL_MS`) — a crash loses at most ~one
+interval of tokens. The live bytes in flight are the SSE deltas, not the DB.
+
+**A client disconnect never writes `interrupted`.** Disconnect only removes
+a subscriber; the generation always runs to `completed` or `failed`. The
+`interrupted` status is reserved for genuinely unfinished generations:
+orphaned rows after a server restart, and the local view hint when the user
+detaches (Stop) or a transport drop severs a live feed.
 
 `interrupted` vs `failed` is a meaningful distinction (see §5).
 
@@ -109,43 +116,33 @@ message rows.
 
 ## 5. Disconnect vs failure disambiguation
 
-Both surface as "the stream ended without a `done` event". The client
-must be able to tell them apart so a user who clicked Stop doesn't see
-an error toast that suggests the provider is down.
+The disambiguation is **architectural, not heuristic**: the generation loop is
+detached from the HTTP response entirely (`GenerationRegistry`), so a client
+disconnect never even reaches the loop. There is no `isClientDisconnected()`
+branch to get wrong.
 
 ```
-                  ┌──────────────────────────────┐
-stream loop       │  for-await delta from AI     │
-                  └─────────────┬────────────────┘
-                                │
-                ┌───────────────┴───────────────┐
-                │ isClientDisconnected()?       │
-                └──┬─────────────────────────┬──┘
-                   │ yes                     │ no
-                   ▼                         ▼
-        ┌──────────────────────┐    ┌────────────────────────┐
-        │ status = 'interrupted'│    │ status = 'completed'   │
-        │ no error event         │    │ emit 'done' event      │
-        └──────────────────────┘    └────────────────────────┘
-
-catch (error):
-                ┌───────────────────────────────┐
-                │ isClientDisconnected()?       │
-                └──┬─────────────────────────┬──┘
-                   │ yes                     │ no
-                   ▼                         ▼
-        ┌──────────────────────┐    ┌──────────────────────────┐
-        │ status = 'interrupted'│    │ status = 'failed'        │
-        │ no error event         │    │ emit 'error' event with  │
-        │                        │    │ generic client message;  │
-        │                        │    │ store raw detail in      │
-        │                        │    │ errorMessage             │
-        └──────────────────────┘    └──────────────────────────┘
+HTTP response ──client leaves──▶ connection ends (subscriber removed)
+                                     │
+                                     ▼  (loop is untouched)
+     generation loop:  for-await delta from AI
+                                     │
+              ┌──────────────────────┴──────────────┐
+              │ provider succeeds                   │ provider throws
+              ▼                                     ▼
+     status = 'completed'                  status = 'failed'
+     emit done                             emit failed + generic message;
+                                           raw detail in errorMessage
 ```
 
-Both `AbortError`s share the same class — `controller.abort()` from the
-client and `AbortController` from the provider timeout. Disambiguation
-is done by asking `isClientDisconnected()` first.
+A client that disconnects and returns later re-enters through the reconnect
+stream (`GET /conversations/:id/messages/:messageId/stream`): snapshot of the
+content so far, then the remaining deltas, then the terminal event — from the
+SAME generation, without re-invoking the AI. See [API.md](API.md) for the wire
+contract.
+
+The provider timeout's `AbortError` still lands in the failure branch above
+(it is a provider failure, not a disconnect) and persists `failed`.
 
 ---
 
@@ -180,16 +177,18 @@ even if the AI fails to start.
 | DB status | Component rendering | User affordance |
 |---|---|---|
 | `null` (user row) | Soft accent block, `dir="auto"` | none (read-only history) |
-| `pending` / `streaming` (no live deltas — refreshed mid-stream) | Muted in-progress text + animated dots (`aria-live="polite"`) | Retry button (defensive; usually the other tab is handling it) |
+| `pending` / `streaming` (no live deltas — just recovered) | Muted in-progress text + animated dots (`aria-live="polite"`) | none — the reconnect stream auto-attaches |
 | `streaming` (live deltas arriving on this tab) | Markdown rendered progressively + caret | Stop button (composer) |
-| `completed` | Full markdown body | Copy + Retry (Retry hides once we add regenerate) |
-| `interrupted` | Italic muted text + partial content | **Retry** (primary accent, first action) |
-| `failed` | Red surface + `errorMessage` | **Retry** (primary accent, first action) |
+| `completed` | Full markdown body | Copy |
+| `interrupted` (after reload: orphaned by restart) | Italic muted partial content + note | **Retry** |
+| `failed` | Red surface + fixed generic note (never the raw `errorMessage`) | **Retry** |
 
 The Retry button is disabled while another send is in flight
 (`streaming.value` is shared across the page). It calls
-`send(userRow.content, { clientMessageId: userRow.clientMessageId })`,
-which the backend treats as a replay.
+`send(userRow.content, { clientMessageId, existingUserRowId: userRow.id })`:
+the user row stays on screen (no duplicate bubble) and the backend treats the
+call as a replay. The raw persisted `errorMessage` is an internal ops detail
+and is never rendered.
 
 ---
 
@@ -228,9 +227,9 @@ the request will surface the same generic error a failed stream would.
 
 | Layer | Tool | What it covers |
 |---|---|---|
-| Service (`messages.service.spec.ts`) | Jest + mocked repository | Pre-persist, status transitions, idempotency reuse/conflict, replay, one-row-per-turn invariant, rename rules, content/attribution per model. 17 specs. |
-| HTTP smoke (`scripts/smoke-test.mjs`) | Node fetch | Full black-box: auth, ownership, plan authorization, model CRUD, **status='failed'**, **meta carries assistantMessage + replay=false**, **clientMessageId reuse**, **Idempotency-Key header**, **content-mismatch → 400**. 75 checks. |
-| Live resilience (`scripts/resilience-test.mjs`) | Node fetch + real aborts | Aborts mid-stream, checks `status='interrupted'` + partial content kept; verifies Retry semantics; verifies Idempotency-Key header round-trip. 14 checks. |
+| Service (`messages.service.spec.ts`) | Jest + mocked repository | Detached generation lifecycle, disconnect-completes, throttled incremental persistence, reconnect snapshot+remaining-delta equality, completed-replay-without-AI, orphan honesty, idempotency reuse/conflict, replay, one-row-per-turn invariant. 21 specs. |
+| HTTP smoke (`scripts/smoke-test.mjs`) | Node fetch | Full black-box: auth, ownership, plan authorization, model CRUD, **status='failed' + failed SSE event**, **meta carries assistantMessage + replay=false**, **clientMessageId reuse**, **Idempotency-Key header**, **content-mismatch → 400**. 75 checks. |
+| Live resilience (`scripts/resilience-test.mjs`) | Node fetch + real aborts | **Detach-and-complete**: abort mid-stream → generation still completes; reconnect replay of completed rows creates no new rows; two clients on one live generation (snapshot + remaining deltas, no dup/missing tokens); foreign reconnect → 404; retry/replay row counts; Idempotency-Key round-trip; abort-before-send creates no rows. 28 checks. |
 | Vite dev server smoke | `curl` against the SPA | Routes mount, ChatView bundle includes the new imports. |
 | Frontend | `vue-tsc --noEmit` + production build | Type safety + compile. |
 
@@ -244,13 +243,19 @@ available in the dev environment). Manual coverage is documented in
 
 - **No WebSocket** — SSE is enough for one-way streaming.
 - **No Redis / BullMQ / queue** — the database is the durable buffer.
-- **No optimistic concurrency on the assistant row** — only one tab can
-  stream at a time (the `streaming.value` guard). Concurrent writers
-  would race; we accept that as a known limitation.
-- **No `pending` row cleanup job** — rows stay in `pending` if the
-  server crashes mid-stream. A future hardening pass could add a
-  periodic job to mark them `interrupted` after a stale threshold.
+- **No cross-process generation registry** — `GenerationRegistry` is
+  in-process and in-memory only. The DB stays the source of truth; a server
+  restart orphans in-flight rows, which are then honestly marked
+  `interrupted` and offered for retry (no fake resume).
+- **No `pending` row cleanup job** — an orphaned row is marked `interrupted`
+  lazily when a client reconnects to it. A future hardening pass could add a
+  periodic sweep for conversations nobody reopens.
 - **No client-side retry queue for failed sends** — Retry is a
   deliberate user action. We never silently re-send.
 - **No separate "regenerate" endpoint** — Retry today creates a new
   assistant row; "regenerate" is the same surface with different copy.
+- **No token-level provider resume** — stateless completion APIs cannot
+  resume a stream at a byte offset. The reconnect stream rejoins the SAME
+  in-process generation while it is alive; once it is gone (restart), the
+  partial content is kept and the row becomes retryable. No faked
+  continuation, ever.

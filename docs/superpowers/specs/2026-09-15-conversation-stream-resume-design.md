@@ -1,10 +1,34 @@
 # Conversation Stream Resume — Design
 
 **Date:** 2026-09-15
-**Status:** Proposed
+**Status:** Superseded — see note below
 **Author:** (brainstorming session)
 **Parent spec:** [docs/CONVERSATION_RESILIENCE.md](../../../docs/CONVERSATION_RESILIENCE.md)
 **Scope:** Single phase. One feature. New endpoint + new module + small schema migration.
+
+> **⚠ SUPERSEDED BY THE AS-BUILT IMPLEMENTATION.** This document records the
+> brainstorming design (SSE `Last-Event-ID` cursor + `StreamRegistry` ring
+> buffer + `last_event_id` column + auto-retry composable). The shipped
+> implementation took a simpler and stronger path:
+>
+> - `GenerationRegistry` (in-process fan-out + authoritative content buffer)
+>   instead of a ring buffer of numbered events;
+> - a **snapshot-based reconnect stream** (`GET .../messages/:messageId/stream`):
+>   subscribe-first, then snapshot of all content so far, then the remaining
+>   deltas — no event ids, no `Last-Event-ID` header, no 410s, no ring-buffer
+>   eviction window;
+> - **detached generation**: client disconnect only unsubscribes; the answer
+>   always completes and persists, so Tier-2 auto-retry-on-return was not
+>   needed — the reconnect stream replays or joins the same generation, and
+>   an orphaned row (server restart) is honestly marked `interrupted` for the
+>   user to retry;
+> - **no schema change** — no `last_event_id` column; status/content live on
+>   the existing `messages` row.
+>
+> The authoritative, up-to-date contract is [docs/API.md](../../../API.md)
+> (§ Reconnect / recovery stream) and
+> [docs/CONVERSATION_RESILIENCE.md](../../../CONVERSATION_RESILIENCE.md).
+> Everything below is kept for design-history traceability.
 
 ---
 
@@ -253,6 +277,19 @@ baseline.
 - Bail out early if `streaming.value === true` (the user is mid-send;
   they shouldn't be auto-retried on top of an active send).
 
+**`send()` change in `ChatView.vue`** to fix a pre-existing
+duplicate-user-bubble bug surfaced by auto-retry:
+- `send()` currently always pushes an `optimisticUser` row into
+  `messages.value` before the server returns. For a brand-new send,
+  this is necessary (the real user row doesn't exist yet). For a
+  retry (manual OR auto), the real user row is already in the array,
+  so the optimistic push creates a duplicate bubble.
+- New `options.existingUserRowId?: string` parameter on `send()`.
+  When provided, skip the optimistic push and reuse the existing row.
+- The existing manual `retry()` is updated to pass
+  `existingUserRowId: userRow.id`.
+- `useAutoRetryOnLoad` likewise passes `existingUserRowId`.
+
 **ChatView.vue:** after `loadMessages()` resolves, call
 `useResumeOnLoad` (Tier 1: resume a live buffer if present) and
 `useAutoRetryOnLoad` (Tier 2: auto-retry a terminal row if the buffer
@@ -472,6 +509,9 @@ Carried over from CONVERSATION_RESILIENCE.md §11 and added:
    - `useAutoRetryOnLoad` ships. Tier 2.
    - `MessageItem.vue` change: hide Retry button + `errorMessage`
      paragraph for `interrupted`/`failed` rows.
+   - `ChatView.vue` `send()` change: new `existingUserRowId` option
+     to fix the duplicate-user-bubble bug surfaced by auto-retry.
+     The existing manual `retry()` is updated in the same commit.
    - ChatView wires both composables after `loadMessages()`.
    - No flag flip needed — auto-retry is silent and falls back
      gracefully if the server hasn't shipped yet.
