@@ -25,35 +25,98 @@ JWT payload: `{ sub: userId, email, role }`, expires in `JWT_EXPIRES_IN` (defaul
 
 ## Messages (streaming)
 
-`POST /conversations/:conversationId/messages` — body `{ content, modelId? }`
+`POST /conversations/:conversationId/messages` — body `{ content, modelId?, clientMessageId? }`
 
 - `content` must be non-blank, ≤ 4000 chars (validated at the boundary)
 - `modelId` optional; must reference a model that is **active** (and **free** for FREE-plan
   callers) — otherwise the default model is used. Authorization is re-checked on every send
   against current backend state; the frontend is never trusted (403 for a premium model
   requested by a FREE user, even via direct API calls).
+- `clientMessageId` optional; opaque client-generated token (≤ 64 chars) used for idempotency.
+  The same value may also be sent as the `Idempotency-Key` HTTP header — both are accepted,
+  the header is just a convenience for proxies and replay logs.
 
-Pre-flight failures return normal JSON errors (404 unknown/foreign conversation, 404 unknown
-model, 400 inactive model / no valid default, 403 model not allowed for the caller's plan).
-Success responds **200 text/event-stream**:
+### Pre-flight
+
+All 4xx-class errors (auth, ownership, plan, model state, **idempotency content collision**)
+are caught by `MessagesService.assertChatTurnAllowed` **before** the SSE headers are
+flushed. The frontend never sees an orphan SSE response carrying a JSON error.
+
+| Failure | Status | Body |
+|---|---|---|
+| Unknown / foreign conversation | 404 | `{ message }` |
+| Unknown model id | 404 | `{ message }` |
+| Inactive model | 400 | `{ message }` |
+| Model not allowed for caller's plan | 403 | `{ message }` |
+| `clientMessageId` matches an existing user row whose `content` differs | 400 | `{ message: "این پیام قبلاً با متن دیگری ارسال شده است." }` |
+
+### Success — 200 `text/event-stream`
+
+Exactly one assistant message row is persisted per turn in every outcome, including failure.
+The order of events on a normal run:
 
 ```
 event: meta
-data: {"userMessage":{...},"model":{"id","name","provider"}}
+data: {
+  "userMessage":      { id, role: "user", content, status: null, ... },
+  "assistantMessage": { id, role: "assistant", content: "", status: "pending", ... },
+  "model":            { id, name, provider },
+  "replay":           false
+}
 
 event: delta
-data: {"text":"chunk"}
+data: { "text": "chunk" }     // repeated as the provider streams
 
 event: done
-data: {"assistantMessage":{ "status": "completed", ... }}
-
--- or, on provider failure (partial content already persisted with status "error"):
-
-event: error
-data: {"message":"سرویس هوش مصنوعی موقتاً در دسترس نیست. لطفاً دوباره تلاش کنید."}
+data: { "assistantMessage": { status: "completed", content, ... } }
 ```
 
-Exactly one assistant message is persisted per turn in every outcome.
+`meta` carries the real `assistantMessage.id` so the client can swap its placeholder for
+the persisted row immediately (no race between optimistic UI and DB state).
+
+### Replay
+
+A `clientMessageId` that matches an existing user row **with the same content** is treated
+as a retry: the existing user row is reused (no duplicate), a **fresh** assistant row is
+created, and `meta.replay = true`. The body of the request must match the original
+character-for-character; see the `400` row above for the mismatch path.
+
+### Failure paths
+
+Provider error (timeout, 5xx, refused connection). Partial content is persisted with
+`status: "failed"` and a server-side `errorMessage`. The client receives a non-leaky
+generic message:
+
+```
+event: error
+data: { "message": "سرویس هوش مصنوعی موقتاً در دسترس نیست. لطفاً دوباره تلاش کنید." }
+```
+
+Client disconnect (browser tab closed, network dropped, Stop button). **No `error`
+event is emitted** — the disconnector cannot receive it. The server persists the partial
+answer with `status: "interrupted"` and no `errorMessage`. The next `GET` on the
+conversation surfaces the row as a Retry target.
+
+The full state machine and disambiguation rules live in
+[CONVERSATION_RESILIENCE.md](CONVERSATION_RESILIENCE.md).
+
+### Message shape
+
+```ts
+type MessageStatus = 'pending' | 'streaming' | 'completed' | 'interrupted' | 'failed';
+
+interface Message {
+  id: string;                  // uuid
+  conversationId: string;
+  role: 'user' | 'assistant';
+  content: string;
+  status: MessageStatus | null;  // null on user rows
+  errorMessage: string | null;   // server-side detail, never leaked to client
+  modelId: string | null;
+  clientMessageId: string | null; // user rows only
+  createdAt: string;             // ISO
+}
+```
 
 ## Models (authenticated)
 
@@ -75,7 +138,7 @@ Exactly one assistant message is persisted per turn in every outcome.
 
 | Status | Meaning |
 |---|---|
-| 400 | validation failure (empty/long message, bad UUID, inactive model, default-model rule incl. free access) |
+| 400 | validation failure (empty/long message, bad UUID, inactive model, default-model rule incl. free access, idempotency content collision) |
 | 401 | missing/invalid/expired JWT |
 | 403 | authenticated but insufficient role — or a model the caller's plan is not allowed to use |
 | 404 | unknown or foreign resource (no existence leak) |
