@@ -15,42 +15,67 @@ persisted partial response with a **Retry** button. The user loses any
 in-flight deltas they were about to see and has to consciously click
 Retry, which starts a brand-new assistant row.
 
-This spec replaces that UX with a seamless continuation: when a client
-loads a conversation whose assistant row is still `status='streaming'`,
-it auto-joins the live stream from its last seen event id. The user
-sees bytes continuing to arrive as if nothing happened.
+This spec replaces that UX with a seamless continuation. Two tiers
+of recovery:
+
+1. **Auto-resume** when the server still holds a live buffer for the
+   assistant row (typically within 60 seconds of the disconnect, or
+   while a stream is still actively producing). The client joins the
+   live SSE stream from its last seen event id and bytes continue
+   arriving as if nothing happened.
+2. **Auto-retry on return** when the buffer is gone (more than 60
+   seconds after the stream ended, or after a server restart, or for
+   a row that was already `interrupted` / `failed`). The client
+   splices out the partial row and starts a fresh stream with the
+   same `clientMessageId` (idempotency reuses the user row). No
+   manual Retry button is shown.
 
 **Threat model (from CONVERSATION_RESILIENCE.md §1) updated:**
 
 | # | Event | New behavior |
 |---|---|---|
-| 1 | Refresh mid-stream | Auto-join live stream from cursor. Bytes continue arriving. No Retry. |
+| 1 | Refresh mid-stream | Auto-resume from cursor. Bytes continue arriving. No Retry. |
 | 2 | Tab close mid-stream | Same as #1 on next visit. |
 | 3 | Open a second tab mid-stream | Tab B joins the live stream from its own (lower) cursor. Server fans out the same events to both. |
-| 4 | Internet drops mid-stream | LocalStorage holds the cursor. On reconnect, auto-join picks up. |
-| 5 | Provider failure | `status='failed'` (terminal). Resume returns 410. Standard Retry UI. |
-| 6 | User hits Stop | `status='interrupted'` (terminal). Resume returns 410. Standard Retry UI. |
+| 4 | Internet drops mid-stream | LocalStorage holds the cursor. On reconnect, auto-resume picks up. |
+| 5 | Provider failure | `status='failed'` (terminal). On next visit, auto-retry kicks off without a manual Retry click. |
+| 6 | User hits Stop | `status='interrupted'` (terminal). On next visit, auto-retry kicks off without a manual Retry click. |
+| 7 | User returns after >60s of interrupt | Buffer gone. Auto-retry starts a fresh assistant row. No Retry button shown. |
 
 ---
 
 ## 2. Approach
 
-**SSE Last-Event-ID resume.** Standard HTTP semantics. No WebSocket,
-no Redis, no replay log.
+Two tiers of recovery, both implemented in this spec:
 
-- The server tracks every active stream in memory: a ring buffer of
-  recent events (id, name, data), a set of live subscribers, and the
-  last issued event id.
-- Every event carries an `id:` line so the client (and the server's
-  replay logic) can address it.
-- A new endpoint `GET /conversations/:id/messages/:messageId/stream`
-  accepts an optional `Last-Event-ID` header. If present, the server
-  replays buffered events with id > Last-Event-ID then attaches the
-  client as a live subscriber.
-- The client persists its last seen event id per message in
-  `localStorage` (keyed by `hooshyar.lastEventId.<messageId>`). On
-  page load, if any assistant row has `status='streaming'`, the chat
-  view kicks off a resume subscription automatically.
+- **Tier 1 — SSE Last-Event-ID resume** for active streams. Standard
+  HTTP semantics. No WebSocket, no Redis, no replay log.
+  - The server tracks every active stream in memory: a ring buffer of
+    recent events (id, name, data), a set of live subscribers, and
+    the last issued event id.
+  - Every event carries an `id:` line so the client (and the
+    server's replay logic) can address it.
+  - A new endpoint `GET /conversations/:id/messages/:messageId/stream`
+    accepts an optional `Last-Event-ID` header. If present, the
+    server replays buffered events with id > Last-Event-ID then
+    attaches the client as a live subscriber.
+  - The client persists its last seen event id per message in
+    `localStorage` (keyed by `hooshyar.lastEventId.<messageId>`). On
+    page load, if any assistant row has `status='streaming'` AND the
+    server has a live buffer, the chat view kicks off a resume
+    subscription automatically.
+- **Tier 2 — Auto-retry on return** when the live buffer is gone
+  (>60s after terminal, or after server restart) OR when the row is
+  already `interrupted` / `failed`.
+  - The client scans the loaded messages for terminal assistant
+    rows, splices the partial out, and re-sends the same
+    `clientMessageId`. Idempotency reuses the user row; a fresh
+    assistant row streams in.
+  - Bounded by a 10-minute localStorage flag per messageId so a
+    persistently-failing AI doesn't loop.
+  - The Retry button on `interrupted` / `failed` rows is removed.
+    Users never see "Client disconnected before completion" +
+    "تلاش مجدد"; they just see the new stream.
 
 ---
 
@@ -135,10 +160,11 @@ has been evicted and the request returns 410 (see below).
 4. If `status` is `streaming` or `pending`:
    - Look up registry entry by messageId.
    - If absent: return 410 with the row (server restarted, buffer
-     lost; client sees persisted snapshot + Retry).
+     lost; client falls through to `useAutoRetryOnLoad`).
    - If `Last-Event-ID` is provided AND the buffer is non-empty AND
      `Last-Event-ID < buffer.oldestEventId - 1`: return 410 with the
-     row (gap too large for replay).
+     row (gap too large for replay). Client falls through to
+     `useAutoRetryOnLoad`.
    - Else: write replay events (events with id > Last-Event-ID),
      attach as live subscriber, keep connection open.
 
@@ -208,8 +234,55 @@ baseline.
 - Return a `disposer` that aborts the active subscription when the
   chat view unmounts or the user navigates away.
 
-**ChatView.vue:** call `useResumeOnLoad` after `loadMessages()`
-resolves. On conversation switch, abort the prior subscription.
+**New composable `useAutoRetryOnLoad`** in
+`frontend/src/composables/useAutoRetryOnLoad.ts`:
+- Input: the loaded `messages` array (ref), a `send` function from
+  the chat view, and a `streaming` ref guard.
+- On mount: scan for the **most recent** assistant row with
+  `status === 'interrupted'` or `status === 'failed'`.
+- Find the user row immediately preceding it.
+- Check `localStorage['hooshyar.autoRetried.<messageId>']` — if set
+  and recent (< 10 minutes), skip. This prevents an infinite
+  auto-retry loop if the AI provider keeps failing.
+- Otherwise: splice the failed/interrupted assistant row out of the
+  messages list (matches the existing `retry()` flow), and call
+  `send(userRow.content, { clientMessageId: userRow.clientMessageId })`.
+- Set the localStorage flag with the current timestamp.
+- Clear the flag once the new attempt reaches a terminal status
+  (success or fail).
+- Bail out early if `streaming.value === true` (the user is mid-send;
+  they shouldn't be auto-retried on top of an active send).
+
+**ChatView.vue:** after `loadMessages()` resolves, call
+`useResumeOnLoad` (Tier 1: resume a live buffer if present) and
+`useAutoRetryOnLoad` (Tier 2: auto-retry a terminal row if the buffer
+is gone). On conversation switch, abort the prior resume subscription.
+
+**Frontend rendering changes in `MessageItem.vue`:**
+- For `status === 'interrupted'`: the Retry button is **hidden**
+  (auto-retry handles it). The `errorMessage` text ("Client
+  disconnected before completion.") is **not shown** — it is an
+  internal server detail, not user-facing copy.
+- For `status === 'failed'`: the Retry button is **hidden**.
+  `errorMessage` is also hidden because the row is replaced by the
+  auto-retry before the user has time to read it; the new attempt
+  produces a fresh message.
+- The Copy button and the completed-message styling are unchanged.
+
+### 3.6 Tier 1 vs Tier 2 — which path runs
+
+| On conversation load, for each assistant row… | Tier |
+|---|---|
+| `status === 'streaming'` AND server has a live buffer | Resume from cursor (3.5: `useResumeOnLoad`) |
+| `status === 'streaming'` AND server has no buffer (restart) | Auto-retry (3.5: `useAutoRetryOnLoad`) |
+| `status === 'interrupted'` | Auto-retry |
+| `status === 'failed'` | Auto-retry |
+| `status === 'completed'` | Nothing (render only) |
+| `status === 'pending'` | Treat as streaming; resume or auto-retry |
+
+The two tiers are sequenced: resume wins when it can produce bytes
+without consuming an AI turn. Auto-retry only runs when resume returns
+410 (no buffer / gap too large) or when the row is already terminal.
 
 ### 3.6 Multi-tab semantics
 
@@ -264,35 +337,58 @@ Browser refresh during a stream. Server is at event 50.
    - streamingRow.status = 'completed'.
 ```
 
-### 4.2 Buffer evicted (stream terminated long ago)
+### 4.2 Buffer evicted (stream terminated long ago) → Auto-retry
 
 ```
 Stream finished 5 minutes ago. Buffer evicted. lastEventId=80.
+Row is `completed` in DB.
 
-1. ChatView mounts. Reads status='completed' from GET response.
+1. ChatView mounts. GET response includes the completed row.
 2. useResumeOnLoad: status is terminal, no resume.
-3. Renders the persisted row. Standard completed-message UI.
+3. useAutoRetryOnLoad: status is `completed`, not interrupted/failed —
+   no auto-retry.
+4. Renders the persisted row. Standard completed-message UI.
 
-(Resume path itself:)
+(If the row had been `interrupted` or `failed` instead:)
 
-1. Client opens GET .../stream with Last-Event-ID: 60.
-2. Server: status='completed', lastEventId=80, no buffer.
-3. Returns 410 with the row in the body.
-4. Client falls back to the existing rendering. No error toast.
+1. ChatView mounts. GET response includes the interrupted row +
+   the preceding user row with its clientMessageId.
+2. useResumeOnLoad: status is terminal, no resume.
+3. useAutoRetryOnLoad: status is `interrupted` (or `failed`).
+4. Checks localStorage 'hooshyar.autoRetried.<messageId>' — empty,
+   so it proceeds.
+5. Splices the interrupted row out of messages.value.
+6. Calls send(userRow.content, { clientMessageId: <persisted id> }).
+7. Server recognizes the idempotency, reuses the user row, persists
+   a fresh assistant row with status='pending', streams it.
+8. Client renders the new streaming row.
+9. localStorage flag is set so we don't auto-retry again within 10
+   minutes if THIS attempt also fails.
 ```
 
-### 4.3 Server restart
+### 4.3 Server restart → Auto-retry
 
 ```
-Server restarts mid-stream. Buffer gone. Row still 'streaming' in DB.
+Server restarts mid-stream. Buffer gone. Row still `streaming` in DB.
 
-1. ChatView loads. status='streaming'.
-2. Opens resume.
-3. Server: row found, status='streaming', no registry entry.
-4. Returns 410 with the row (status='streaming', partial content).
-5. Client: sees a 'streaming' row with no live deltas.
-   Shows the standard "in-progress" UI (CONVERSATION_RESILIENCE.md §7).
-   Retry button is available.
+1. ChatView loads. status='streaming' (the row never moved to a
+   terminal state because the server crashed before persisting).
+2. useResumeOnLoad: opens GET .../stream with Last-Event-ID from
+   localStorage (or absent).
+3. Server: no registry entry → returns 410.
+4. useResumeOnLoad resolves to `{ kind: 'gone' }`. The row is left
+   as-is (status='streaming', partial content).
+5. useAutoRetryOnLoad: scans for terminal-or-streaming rows. The
+   row is 'streaming' (not terminal) — auto-retry does NOT fire
+   here because we can't tell if another process picked up the
+   stream. The user sees the persisted partial + a small
+   "در حال اتصال..." indicator.
+6. After ~10 seconds with no live bytes arriving, useResumeOnLoad
+   gives up (timeout) and useAutoRetryOnLoad treats the row as
+   effectively terminal and retries.
+
+(If the row were already terminal in the DB at restart time, the
+plain auto-retry flow from §4.2 runs.)
 ```
 
 ---
@@ -301,14 +397,19 @@ Server restarts mid-stream. Buffer gone. Row still 'streaming' in DB.
 
 | Failure | Status | Client behavior |
 |---|---|---|
-| Buffer evicted / gap too large | 410 | Fall back to standard rendering of the persisted row. No error toast. |
+| Resume: buffer evicted / gap too large | 410 | Falls through to useAutoRetryOnLoad. No error toast. |
+| Auto-retry: AI provider fails again | (re-enters `failed`) | Row goes back to `failed`. localStorage flag set so we don't loop. The user sees a fresh failed row on next visit (one auto-retry attempt per 10 minutes per messageId). |
 | Auth expired | 401 | Same logout flow as today (CONVERSATION_RESILIENCE.md §10). |
 | Not your conversation/message | 403 / 404 | Conversation reload. |
-| Network error during resume | (transport) | Same generic "ارتباط هنگام دریافت پاسخ قطع شد." toast. The persisted row remains visible. User can Retry. |
+| Network error during resume | (transport) | Same generic "ارتباط هنگام دریافت پاسخ قطع شد." toast. The persisted row remains visible. Auto-retry handles it. |
+| Network error during auto-retry | (transport) | Same toast. The interrupted row remains visible. The next visit will retry again (within the 10-minute window, the flag prevents it; beyond that, it retries). |
 | Slow subscriber falls > 1000 events behind | (server closes conn) | Subscriber receives the events it has, then conn closes. Next resume sees 410. |
 
-No silent retry. No client-side retry queue. Matches
-CONVERSATION_RESILIENCE.md §11.
+Auto-retry is bounded (10-minute flag per messageId), not infinite.
+Matches CONVERSATION_RESILIENCE.md §11 ("No client-side retry queue
+for failed sends — Retry is a deliberate user action"). Auto-retry
+on return IS the deliberate user action — it happens once, when the
+user explicitly opens the conversation.
 
 ---
 
@@ -318,11 +419,14 @@ CONVERSATION_RESILIENCE.md §11.
 |---|---|---|
 | `stream-registry.service.spec.ts` | Jest | Register/record/subscribe, ring buffer eviction at size 1000, multi-subscriber fan-out, scheduleEviction firing after 60s, drop immediate, 410 lookup when no entry. |
 | `messages.service.spec.ts` (extend) | Jest | Stream registers on start, deregisters on terminal, `lastEventId` persisted on done/interrupted/failed, NOT persisted on first delta. |
-| `messages.controller.spec.ts` (extend or new) | Jest | GET endpoint: 200 + SSE replay, 204 terminal, 410 no-buffer, 410 gap, 401, 403, 404, replay ordering. |
+| `messages.controller.spec.ts` (extend or new) | Jest | GET endpoint: 200 + SSE replay, 410 no-buffer, 410 gap, 410 terminal-with-gap, 200 terminal-caught-up (final `done` event), 401, 403, 404, replay ordering. |
 | `scripts/resume-test.mjs` (new) | Node fetch + real aborts | Two concurrent connections receive the same final `done`. Last-Event-ID replay produces no duplicates and no gaps. 410 path. Terminal + 60s eviction verified via stub. |
+| `scripts/auto-retry-test.mjs` (new) | Node fetch | Stream interrupted → 410 on resume → auto-retry kicks off → fresh assistant row streams to completion. Stream `failed` → auto-retry kicks off → fresh assistant row. Auto-retry loop bounded by 10-minute flag. |
 | Existing `resilience-test.mjs` (extend) | Node fetch | Existing interrupted scenarios still pass; new "refresh mid-stream then auto-join" scenario. |
 | `frontend/src/api/client.ts` (extend) | Manual / vite build | resumeStreamMessage dispatches all event types correctly; 410 falls back gracefully. |
 | `useResumeOnLoad.spec.ts` (new) | Vitest | Reads localStorage on mount; aborts on unmount; clears localStorage on done. |
+| `useAutoRetryOnLoad.spec.ts` (new) | Vitest | Fires for interrupted/failed rows; skips when localStorage flag is set within window; splices the partial row; calls send() with the persisted clientMessageId; sets the flag. |
+| `MessageItem.vue` (manual + screenshot diff) | Vitest snapshot | No Retry button for `interrupted`/`failed`. No `errorMessage` paragraph for `interrupted`. |
 | Build | `vue-tsc --noEmit`, `nest build` | Compile clean. |
 
 Browser GUI testing remains manual (no runner available), documented
@@ -340,8 +444,6 @@ Carried over from CONVERSATION_RESILIENCE.md §11 and added:
 - **No per-delta DB writes.** `lastEventId` is set at terminal only.
 - **No Redis / replay log.** The in-memory ring buffer is the entire
   resume surface.
-- **No client-side auto-retry on resume failure.** The user sees the
-  persisted row + Retry button.
 - **No "resume from byte 0" replay.** A fresh subscriber without
   Last-Event-ID attaches live only and relies on the persisted
   snapshot from the GET response.
@@ -349,6 +451,12 @@ Carried over from CONVERSATION_RESILIENCE.md §11 and added:
   subscribe; both receive the same events. The composer is shared.
 - **No buffer persistence across server restarts.** Restart = 410 for
   anyone mid-resume. The `pending` row cleanup gap remains.
+- **No infinite auto-retry loop.** Auto-retry on return is bounded by
+  a 10-minute localStorage flag per messageId. Beyond that window a
+  manual interaction (new send) is required.
+- **No manual Retry button on `interrupted` or `failed` rows.**
+  Auto-retry on return handles them; the user has no second chance
+  to click a button they never see.
 
 ---
 
@@ -359,12 +467,21 @@ Carried over from CONVERSATION_RESILIENCE.md §11 and added:
 2. **Backend deploy:** `StreamRegistry` module ships; `writeEvent`
    emits `id:` lines; new GET endpoint live. Existing POST flow
    unchanged.
-3. **Frontend deploy:** `resumeStreamMessage` + `useResumeOnLoad` ship
-   together. ChatView wires them. No flag flip needed — the auto-join
-   is silent and falls back gracefully if the server hasn't shipped
-   yet (just shows the existing Retry UI).
+3. **Frontend deploy:**
+   - `resumeStreamMessage` + `useResumeOnLoad` ship together. Tier 1.
+   - `useAutoRetryOnLoad` ships. Tier 2.
+   - `MessageItem.vue` change: hide Retry button + `errorMessage`
+     paragraph for `interrupted`/`failed` rows.
+   - ChatView wires both composables after `loadMessages()`.
+   - No flag flip needed — auto-retry is silent and falls back
+     gracefully if the server hasn't shipped yet.
 4. **No DB backfill.** `last_event_id` populates on the next terminal
    transition for each row.
+5. **UX change visibility:** the existing Retry button for
+   `interrupted`/`failed` rows is removed in this release. Users who
+   relied on clicking Retry will see auto-retry kick off instead.
+   This is the intended behavior change; documented in the release
+   notes (not in this spec).
 
 ---
 
