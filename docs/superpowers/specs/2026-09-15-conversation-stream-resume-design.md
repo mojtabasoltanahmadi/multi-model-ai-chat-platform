@@ -284,7 +284,7 @@ The two tiers are sequenced: resume wins when it can produce bytes
 without consuming an AI turn. Auto-retry only runs when resume returns
 410 (no buffer / gap too large) or when the row is already terminal.
 
-### 3.6 Multi-tab semantics
+### 3.7 Multi-tab semantics
 
 Two tabs on the same mid-stream conversation:
 
